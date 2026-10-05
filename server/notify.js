@@ -243,11 +243,12 @@ export function seedExtNotifyTasks() {
   return n
 }
 
-// ===== 危机声明渠道事件 → 通知任务（stmt_event：chfail 单渠道发布失败 / partial 全渠道登记完但存在失败） =====
+// ===== 危机声明渠道事件 → 通知任务（stmt_event：chfail 单渠道发布失败 / partial 全渠道登记完但存在失败 / degraded 按策略降级发布知会） =====
 // 复用通知渠道、失败退避重试、回执与升级调度；幂等键按 声明×事件（×渠道行）×订阅×渠道 去重。
 // chfail：每次渠道登记失败即时通知（同一渠道行重复登记失败按行幂等，重试后再失败可再次通知）；
-// partial：全部渠道到达终态但仍有失败渠道（声明进入「部分失败」、阻塞结案）时的督办通知，按声明幂等。
-export const STMT_EVENT_TEXT = { chfail: '渠道发布失败', partial: '部分渠道失败·发布未完成' }
+// partial：全部渠道到达终态但仍有失败渠道（声明进入「部分失败」、阻塞结案）时的督办通知，按声明+轮次幂等；
+// degraded：声明按降级策略确认/自动降级发布时的知会（在途 partial 督办已联动中止，此为发布完成的知会，非催办），按声明幂等。
+export const STMT_EVENT_TEXT = { chfail: '渠道发布失败', partial: '部分渠道失败·发布未完成', degraded: '声明降级发布知会' }
 export function generateForStatement(stmtId, stmtEvent, extra = {}) {
   const s = q1(`SELECT s.*, c.title crisis_title, c.topic crisis_topic
     FROM crisis_statements s LEFT JOIN crisis c ON c.id=s.crisis_id WHERE s.id=?`, stmtId)
@@ -258,7 +259,9 @@ export function generateForStatement(stmtId, stmtEvent, extra = {}) {
   const topic = s.crisis_topic || ''
   const title = stmtEvent === 'partial'
     ? `【声明发布未完成·部分渠道失败】${s.title}`
-    : `【声明渠道发布失败】${s.title}`
+    : stmtEvent === 'degraded'
+      ? `【声明降级发布·部分渠道失败】${s.title}`
+      : `【声明渠道发布失败】${s.title}`
   let idemTag
   if (stmtEvent === 'chfail') {
     const chRow = extra.channelRow ? q1('SELECT * FROM crisis_statement_channels WHERE id=?', extra.channelRow) : null
@@ -278,8 +281,8 @@ export function generateForStatement(stmtId, stmtEvent, extra = {}) {
         idemTag, corrId: `stmt${s.id}:channels`, title, content
       }))
     }
-  } else {
-    // partial：声明级督办（同一声明仅生成一次；重试恢复后再次失败以新事件轮次区分）
+  } else if (stmtEvent === 'partial') {
+    // partial：声明级督办（重试恢复后再次失败以新事件轮次区分）
     const round = Math.max(1, +extra.partialRound || 1)
     idemTag = `partial:${round}`
     for (const sub of subs) {
@@ -287,10 +290,29 @@ export function generateForStatement(stmtId, stmtEvent, extra = {}) {
       const content = `危机「${s.crisis_title || '#' + s.crisis_id}」声明「${s.title}」分渠道登记全部结束但存在失败渠道：` +
         `${extra.ok ?? 0}/${extra.total ?? 0} 个渠道已发布、${extra.failed ?? 0} 个失败` +
         (extra.cancelled ? `、${extra.cancelled} 个取消` : '') +
-        '；发布未完成，危机暂不能结案，请重试失败渠道或放弃该渠道（取消）'
+        '；发布未完成，危机暂不能结案，请重试失败渠道、放弃该渠道（取消）或按策略确认降级发布'
       all.push(...createTasks(sub, {
         kind: 'statement', statementId: s.id, crisisId: s.crisis_id,
         idemTag, corrId: `stmt${s.id}:partial`, corrSeq: round, title, content
+      }))
+    }
+  } else {
+    // degraded：降级发布知会（终态知会；同一声明仅一次，幂等）
+    idemTag = 'degraded:1'
+    const ratio = Math.round((extra.ratio ?? 0) * 100)
+    const threshold = Math.round((extra.threshold ?? 0.6) * 100)
+    const reqNames = (extra.required || []).map((k) => ({ weibo: '官方微博', wechat: '微信公众号', website: '官网新闻中心', news: '新闻通稿', video: '官方短视频', press: '新闻发布会' }[k] || k))
+    for (const sub of subs) {
+      if (sub.topic && sub.topic !== topic) continue
+      const content = `危机「${s.crisis_title || '#' + s.crisis_id}」声明「${s.title}」已按${extra.auto ? '自动降级策略' : '人工确认'}降级发布：` +
+        `${extra.ok ?? 0}/${extra.total ?? 0} 个渠道已发布（成功率 ${ratio}%，门槛 ${threshold}%）、${extra.failed ?? 0} 个失败` +
+        (extra.cancelled ? `、${extra.cancelled} 个取消` : '') +
+        (reqNames.length ? `，必达渠道（${reqNames.join('、')}）均已发布` : '') +
+        '；声明视为发布完成、不再阻塞危机结案，失败渠道后续补发请另行跟进' +
+        (extra.note ? `。说明：${extra.note}` : '')
+      all.push(...createTasks(sub, {
+        kind: 'statement', statementId: s.id, crisisId: s.crisis_id,
+        idemTag, corrId: `stmt${s.id}:degraded`, corrSeq: 1, title, content
       }))
     }
   }
@@ -302,6 +324,43 @@ export function seedStatementNotifyTasks() {
   let n = 0
   for (const s of q("SELECT id FROM crisis_statements WHERE status='partial'")) {
     n += generateForStatement(s.id, 'partial', { partialRound: 1 }).length
+  }
+  return n
+}
+
+// 降级发布联动：中止该声明仍在途的「部分渠道失败督办」通知（含其回执超时升级链）。
+// 降级为发布终态，partial 督办（需回执、会超时升级）继续催办将与终态矛盾——
+// 待发送不再发送、待回执不再催办/超时升级；任务与留痕保留可审计（与结案联动中止同口径）。
+// 单渠道失败（chfail）提醒多为无需回执的即时提醒，已送达的保留、在途的同样中止以免降级后继续报失败。
+// 返回中止任务数。
+export function settleStatementPartialNotify(stmtId, operator = '系统') {
+  const inflight = ['pending', 'failed', 'paused', 'sent', 'escalated']
+  // 该声明全部 stmt_event 类（partial 督办 + chfail 即时提醒）在途任务及其升级链
+  const roots = q(`SELECT nt.id FROM notify_tasks nt
+    LEFT JOIN notify_subs ns ON ns.id=nt.sub_id
+    WHERE nt.statement_id=? AND nt.kind='statement'
+      AND (ns.stmt_event IN ('partial','chfail') OR nt.corr_id LIKE ?)
+      AND nt.status IN (${inflight.map(() => '?').join(',')})`,
+    stmtId, `stmt${stmtId}:%`, ...inflight)
+  const ids = new Set(roots.map((r) => r.id))
+  // 补齐回执超时升级链后代（升级任务 sub 可能继承同一订阅）
+  for (;;) {
+    const cur = [...ids]
+    if (!cur.length) break
+    const ph = cur.map(() => '?').join(',')
+    const children = q(`SELECT id FROM notify_tasks WHERE escalated_from IN (${ph}) AND status IN (${inflight.map(() => '?').join(',')})`,
+      ...cur, ...inflight).filter((r) => !ids.has(r.id))
+    if (!children.length) break
+    children.forEach((r) => ids.add(r.id))
+  }
+  let n = 0
+  for (const id of ids) {
+    const r = run(`UPDATE notify_tasks SET status='cancelled', updated=? WHERE id=? AND status IN (${inflight.map(() => '?').join(',')})`,
+      now(), id, ...inflight)
+    if (Number(r.changes)) {
+      addLog(id, 'cancelled', '关联危机声明已降级发布（终态），部分失败督办/渠道失败提醒按降级口径中止，不再催办或超时升级', operator)
+      n += 1
+    }
   }
   return n
 }
@@ -818,7 +877,7 @@ export function validateSub(b) {
   const ee = String(b.ext_event || '')
   if (ee && !['submitted', 'escalated'].includes(ee)) return '外部协作事件无效（submitted/escalated）'
   const se = String(b.stmt_event || '')
-  if (se && !['chfail', 'partial'].includes(se)) return '危机声明事件无效（chfail/partial）'
+  if (se && !['chfail', 'partial', 'degraded'].includes(se)) return '危机声明事件无效（chfail/partial/degraded）'
   if ([we, pe, ee, se, cs].filter(Boolean).length > 1) return '预警/危机/工单/传播/外部协作/声明事件订阅互斥，请只选一种匹配方式'
   const chs = Array.isArray(b.channel_ids) ? b.channel_ids.map(Number).filter(Number.isInteger) : []
   if (!chs.length) return '至少选择一个通知渠道'

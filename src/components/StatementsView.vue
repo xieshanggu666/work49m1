@@ -9,13 +9,16 @@
         </button>
         <span v-if="summary.channelOpen" class="chip ch-open">📤 待执行渠道 {{ summary.channelOpen }}</span>
         <span v-if="summary.channelFailed" class="chip ch-fail">⚠️ 失败渠道 {{ summary.channelFailed }}</span>
+        <span v-if="summary.degraded" class="chip ch-degraded">🟡 降级发布 {{ summary.degraded }}</span>
       </div>
       <span class="me">👤 {{ store.user.name }} · {{ roleText(store.user.role) }}</span>
     </div>
     <p class="hint">
       🔗 公关起草危机声明 → 提交法务审核（通过/驳回可重编）→ 审核通过后发起分渠道发布，发布人员按渠道执行并逐条登记结果；
       起草/送审/审核/每个渠道的执行进度自动<b>回写处置工单日志与危机统一时间线</b>；全部渠道<b>成功</b>才发布完成，
-      <b>存在失败渠道时声明为「部分渠道失败」并触发通知升级、阻塞危机结案</b>（失败渠道须重试成功或放弃）。
+      <b>存在失败渠道时声明为「部分渠道失败」并触发督办通知、阻塞危机结案</b>——可按发起时配置的<b>降级发布策略</b>处理：
+      严格模式（仅重试/放弃）、手动确认降级（达成功率/必达渠道门槛后一键降级）、达门槛自动降级；
+      <b>降级发布为终态、不再阻塞结案</b>，自动中止在途部分失败督办并发生效知会。
     </p>
 
     <!-- 起草表单 -->
@@ -101,18 +104,41 @@
           <span v-if="s.publish_by">发布执行 <i>{{ s.publish_by }} · {{ s.publish_at }}</i></span>
           <span v-if="s.published_at">发布完成 <i>{{ s.published_at }}</i></span>
         </div>
-        <div v-if="s.review_note && ['approved','publishing','partial','published'].includes(s.status)" class="review-note">
+        <div v-if="s.review_note && ['approved','publishing','partial','degraded','published'].includes(s.status)" class="review-note">
           ⚖️ 法务审核意见（{{ s.reviewed_by }}）：{{ s.review_note }}
         </div>
 
-        <!-- 部分渠道失败：发布未完成、阻塞结案的强提示 -->
+        <!-- 降级发布策略（发布中/部分失败可查看与调整；终态展示降级事实） -->
+        <div v-if="['publishing','partial','degraded'].includes(s.status)" class="degrade-policy" :class="{locked:s.status==='degraded'}">
+          <span class="dp-tag">🛟 失败处理：{{ s.degradeModeText }}</span>
+          <span>成功率门槛 <b>{{ Math.round((s.degrade_min_ratio ?? 0.6) * 100) }}%</b></span>
+          <span v-if="s.degradeRequired && s.degradeRequired.length">必达渠道：
+            <i v-for="k in s.degradeRequired" :key="k">{{ dict.channels[k] || k }} </i>
+          </span>
+          <span v-else>无必达渠道</span>
+          <button v-if="canOps && ['publishing','partial'].includes(s.status)" class="op dp-edit" @click="openPolicy(s)">⚙ 调整策略</button>
+        </div>
+
+        <!-- 部分渠道失败：发布未完成、阻塞结案；按策略可重试/放弃/降级 -->
         <div v-if="s.status==='partial'" class="partial-box">
           ⚠️ 部分渠道发布失败：{{ s.progress.ok }}/{{ s.channelRows.length }} 已发布、失败 {{ s.progress.fail }}，
-          声明<b>未完成发布并阻塞危机结案</b>，且已按订阅触发督办通知升级——请对失败渠道<b>重试</b>或<b>放弃该渠道</b>
+          声明<b>未完成发布并阻塞危机结案</b>，已按订阅触发督办通知升级——请对失败渠道<b>重试</b>或<b>放弃该渠道</b>
+          <template v-if="s.degrade_mode==='strict'">；当前为<b>严格模式</b>，不允许降级</template>
+          <template v-else-if="s.degradeEligibility && s.degradeEligibility.ok">；已达降级门槛，可
+            <button class="inline-btn degrade" @click="openDegrade(s)">🟡 确认降级发布</button>（终态、放行结案、中止督办）
+          </template>
+          <template v-else>；当前<b>未达降级门槛</b>（{{ s.degradeEligibility?.reason }}），可重试/放弃后再判定</template>
+        </div>
+
+        <!-- 降级发布终态：部分失败但已按策略降级，不阻塞结案 -->
+        <div v-if="s.status==='degraded'" class="degraded-box">
+          🟡 已降级发布：{{ s.progress.ok }}/{{ s.channelRows.length }} 个渠道成功（成功率 {{ s.degradeEligibility ? Math.round(s.degradeEligibility.ratio*100) : Math.round((s.progress.ok/s.channelRows.length)*100) }}%，门槛 {{ Math.round((s.degrade_min_ratio ?? 0.6)*100) }}%）、失败 {{ s.progress.fail }}，
+          确认人 <b>{{ s.degrade_by || '系统' }}</b> · {{ s.degrade_at }}；声明视为<b>发布完成、不阻塞结案</b>，在途部分失败督办已中止并发出降级知会
+          <div v-if="s.degrade_note" class="dg-note">📝 {{ s.degrade_note }}</div>
         </div>
 
         <!-- 分渠道发布进度 -->
-        <div v-if="['publishing','partial','published','cancelled'].includes(s.status) && s.channelRows.length" class="ch-block">
+        <div v-if="['publishing','partial','degraded','published','cancelled'].includes(s.status) && s.channelRows.length" class="ch-block" :class="{'degraded':s.status==='degraded'}">
           <div class="ch-progress">
             <div class="bar"><i :style="{width: s.progress.pct+'%'}" :class="{partial:s.progress.fail&&s.progress.ok}"></i></div>
             <b>{{ s.progress.ok }}/{{ s.channelRows.length }} 已发布</b>
@@ -194,12 +220,103 @@
         </div>
       </div>
     </div>
+
+    <!-- 发起分渠道发布配置弹窗（渠道清单 + 降级发布策略） -->
+    <div v-if="pub.open" class="modal-mask" @click.self="pub.open=false">
+      <div class="modal">
+        <h4>📢 发起分渠道发布</h4>
+        <p class="m-sub">声明「{{ pub.title }}」· 共 {{ pub.channels.length }} 个渠道</p>
+        <label class="m-field">执行人（默认发布人员）
+          <input v-model="pub.assignee" placeholder="执行人" />
+        </label>
+        <DegradePolicyFields :cfg="pub" :channels="pub.channels" :dict="dict" />
+        <div class="m-actions">
+          <button class="save" @click="submitPublish">确认发起发布</button>
+          <button class="ghost" @click="pub.open=false">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 确认降级发布弹窗（partial + 达门槛） -->
+    <div v-if="dg.open" class="modal-mask" @click.self="dg.open=false">
+      <div class="modal">
+        <h4>🟡 确认降级发布</h4>
+        <p class="m-sub">声明「{{ dg.title }}」· 当前 {{ dg.ok }}/{{ dg.total }} 个渠道成功、{{ dg.failed }} 个失败</p>
+        <div class="dg-elig">
+          成功率 <b>{{ Math.round(dg.ratio*100) }}%</b>（门槛 {{ Math.round((dg.threshold ?? 0.6)*100) }}%）
+          <template v-if="dg.required.length">· 必达渠道：<i v-for="k in dg.required" :key="k">{{ dict.channels[k] || k }} </i>（均已发布）</template>
+        </div>
+        <p class="dg-warn">降级发布为<b>终态</b>：声明视为发布完成、<b>不再阻塞危机结案</b>；系统将自动中止仍在途的部分失败督办通知（含回执超时升级链），并按订阅发出降级发布知会；失败渠道需后续另行补发。</p>
+        <label class="m-field">可在此收紧门槛（可选；放宽不可超过发起策略，未达门槛将拒绝）
+          <DegradePolicyFields :cfg="dg" :channels="dg.channelKeys" :dict="dict" :allow-mode="false" />
+        </label>
+        <label class="m-field">降级发布说明（失败渠道原因与后续补发安排）
+          <textarea v-model="dg.note" placeholder="如：核心官方渠道已覆盖，新闻通稿网关故障、短视频平台维护，恢复后补发"></textarea>
+        </label>
+        <div class="m-actions">
+          <button class="save degrade-btn" @click="submitDegrade">确认降级发布</button>
+          <button class="ghost" @click="dg.open=false">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 调整降级策略弹窗 -->
+    <div v-if="policy.open" class="modal-mask" @click.self="policy.open=false">
+      <div class="modal">
+        <h4>⚙ 配置降级发布策略</h4>
+        <p class="m-sub">声明「{{ policy.title }}」</p>
+        <DegradePolicyFields :cfg="policy" :channels="policy.channelKeys" :dict="dict" />
+        <p class="dg-warn">改为「达门槛自动降级」且当前渠道实况已满足门槛时，将立即自动降级收口。</p>
+        <div class="m-actions">
+          <button class="save" @click="submitPolicy">保存策略</button>
+          <button class="ghost" @click="policy.open=false">取消</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, h } from 'vue'
 import { usePubStore } from '@/store/pub'
+
+// 降级发布策略字段（发起发布 / 确认降级 / 调整策略三处复用）
+const DegradeModeText = { strict: '严格模式（不降级，仅重试/放弃）', manual: '手动确认降级', auto: '达门槛自动降级' }
+const DegradePolicyFields = {
+  props: { cfg: Object, channels: { type: Array, default: () => [] }, dict: Object, allowMode: { type: Boolean, default: true } },
+  setup(props) {
+    return () => h('div', { class: 'dg-fields' }, [
+      props.allowMode ? h('label', { class: 'm-field' }, [
+        '失败处理策略',
+        h('select', {
+          value: props.cfg.degrade_mode,
+          onChange: (e) => { props.cfg.degrade_mode = e.target.value }
+        }, Object.entries(DegradeModeText).map(([k, v]) => h('option', { value: k }, v)))
+      ]) : null,
+      h('label', { class: 'm-field' }, [
+        `降级成功率门槛（成功渠道占比，当前可选 0%~100%）：${Math.round((props.cfg.degrade_min_ratio ?? 0.6) * 100)}%`,
+        h('input', {
+          type: 'range', min: 0, max: 100, step: 10,
+          value: Math.round((props.cfg.degrade_min_ratio ?? 0.6) * 100),
+          onInput: (e) => { props.cfg.degrade_min_ratio = Number(e.target.value) / 100 }
+        })
+      ]),
+      h('div', { class: 'm-field' }, [
+        h('span', { class: 'lbl' }, '必达渠道（任一未成功则不可降级）：'),
+        h('div', { class: 'ch-pick' }, (props.channels || []).map((k) => h('label', { class: ['ch-opt', { on: (props.cfg.degrade_required || []).includes(k) }] }, [
+          h('input', {
+            type: 'checkbox', checked: (props.cfg.degrade_required || []).includes(k),
+            onChange: (e) => {
+              const set = new Set(props.cfg.degrade_required || [])
+              if (e.target.checked) set.add(k); else set.delete(k)
+              props.cfg.degrade_required = [...set]
+            }
+          }), ` ${props.dict?.channels?.[k] || k}`
+        ])))
+      ])
+    ])
+  }
+}
 
 const store = usePubStore()
 const items = ref([])
@@ -219,6 +336,12 @@ function emptyForm() {
 }
 
 const reg = ref({ open: false, chId: null, status: 'success', assignee: '', result: '', url: '', failReason: '', channel: null, title: '' })
+// 发起发布配置
+const pub = ref({ open: false, id: null, title: '', channels: [], assignee: '', degrade_mode: 'strict', degrade_min_ratio: 0.6, degrade_required: [] })
+// 确认降级
+const dg = ref({ open: false, id: null, title: '', ok: 0, failed: 0, total: 0, ratio: 0, threshold: 0.6, required: [], channelKeys: [], note: '', degrade_min_ratio: 0.6, degrade_required: [] })
+// 调整策略
+const policy = ref({ open: false, id: null, title: '', channelKeys: [], degrade_mode: 'strict', degrade_min_ratio: 0.6, degrade_required: [] })
 
 const canOps = computed(() => ['admin', 'ops'].includes(store.user.role))
 const isAdmin = computed(() => store.user.role === 'admin')
@@ -238,7 +361,9 @@ function logText(a) {
     create: '起草', edit: '修改', submit: '送审', approve: '审核通过', reject: '驳回',
     publish: '发起发布', channel_result: '渠道登记', channel_retry: '渠道重试',
     channel_cancel: '渠道取消/放弃', done: '发布完成', partial: '部分失败',
-    notify_partial: '失败督办通知', cancel_all: '全部取消', migrate_status: '状态修复', cancel: '取消'
+    notify_partial: '失败督办通知', cancel_all: '全部取消', migrate_status: '状态修复', cancel: '取消',
+    degraded: '降级发布', degrade_policy: '降级策略', notify_degrade: '降级通知联动',
+    notify_degraded: '降级知会通知', migrate_degrade: '历史降级兼容'
   }[a] || a
 }
 
@@ -325,9 +450,65 @@ async function reject(s) {
   if (note == null || !note.trim()) return
   try { await store.rejectStatement(s.id, note.trim()); await load() } catch (e) { store.msg(e.message, 'warn') }
 }
-async function startPublish(s) {
-  if (!confirm(`确认对「${s.title}」发起分渠道发布？\n将按起草时选定的 ${s.channels.length} 个渠道生成执行任务，由发布人员逐渠道登记结果。`)) return
-  try { await store.startStatementPublish(s.id, {}); await load() } catch (e) { store.msg(e.message, 'warn') }
+function startPublish(s) {
+  pub.value = {
+    open: true, id: s.id, title: s.title, channels: [...(s.channels || [])],
+    assignee: store.user.name, degrade_mode: 'strict', degrade_min_ratio: 0.6, degrade_required: []
+  }
+}
+async function submitPublish() {
+  const p = pub.value
+  if (!p.channels.length) { store.msg('至少需要一个发布渠道', 'warn'); return }
+  if (p.degrade_required.some((k) => !p.channels.includes(k))) { store.msg('必达渠道必须包含在发布渠道清单内', 'warn'); return }
+  try {
+    await store.startStatementPublish(p.id, {
+      channels: p.channels, assignee: p.assignee,
+      degrade_mode: p.degrade_mode, degrade_min_ratio: p.degrade_min_ratio, degrade_required: p.degrade_required
+    })
+    p.open = false
+    await load()
+  } catch (e) { store.msg(e.message, 'warn') }
+}
+function openDegrade(s) {
+  const elig = s.degradeEligibility || {}
+  dg.value = {
+    open: true, id: s.id, title: s.title,
+    ok: s.progress.ok, failed: s.progress.fail, total: s.channelRows.length,
+    ratio: elig.ratio ?? (s.progress.ok / s.channelRows.length), threshold: s.degrade_min_ratio ?? 0.6,
+    required: [...(s.degradeRequired || [])], channelKeys: (s.channels || []),
+    note: '', degrade_min_ratio: s.degrade_min_ratio ?? 0.6, degrade_required: [...(s.degradeRequired || [])]
+  }
+}
+async function submitDegrade() {
+  const d = dg.value
+  try {
+    const r = await store.confirmStatementDegrade(d.id, {
+      degrade_min_ratio: d.degrade_min_ratio, degrade_required: d.degrade_required, note: d.note.trim()
+    })
+    d.open = false
+    await load()
+    if (openLogsId.value) await refreshLogs(openLogsId.value)
+    store.msg(`降级发布完成：${r.ok}/${r.total} 渠道成功，中止 ${r.cancelledTasks} 条在途督办`, 'success')
+  } catch (e) { store.msg(e.message, 'warn') }
+}
+function openPolicy(s) {
+  policy.value = {
+    open: false, id: s.id, title: s.title, channelKeys: (s.channels || []),
+    degrade_mode: s.degrade_mode || 'strict', degrade_min_ratio: s.degrade_min_ratio ?? 0.6,
+    degrade_required: [...(s.degradeRequired || [])]
+  }
+  policy.value.open = true
+}
+async function submitPolicy() {
+  const p = policy.value
+  try {
+    const r = await store.updateStatementDegradePolicy(p.id, {
+      degrade_mode: p.degrade_mode, degrade_min_ratio: p.degrade_min_ratio, degrade_required: p.degrade_required
+    })
+    p.open = false
+    await load()
+    if (r.degraded && openLogsId.value) await refreshLogs(openLogsId.value)
+  } catch (e) { store.msg(e.message, 'warn') }
 }
 async function cancelStmt(s) {
   const reason = prompt(`取消声明「${s.title}」？\n${['publishing', 'partial'].includes(s.status) ? '在途/失败渠道将一并取消。\n' : ''}取消原因（可留空）：`)
@@ -407,6 +588,8 @@ onUnmounted(() => clearInterval(timer))
 .chip.review.on{border-color:#ffb300;background:#33270e;color:#ffe082;}
 .chip.publishing.on{border-color:#42a5f5;background:#0d2137;color:#90caf9;}
 .chip.partial.on{border-color:#ff7043;background:#33180f;color:#ffab91;}
+.chip.degraded.on{border-color:#ffca28;background:#332b0e;color:#ffe082;}
+.chip.ch-degraded{border-color:rgba(255,202,40,.55);color:#ffe082;background:#2e2810;cursor:default;}
 .chip.published.on{border-color:#66bb6a;background:#14261a;color:#a5d6a7;}
 .chip.ch-open{border-color:rgba(66,165,245,.5);color:#90caf9;background:#0d2137;cursor:default;}
 .chip.ch-fail{border-color:rgba(239,83,80,.5);color:#ef9a9a;background:#2c1418;cursor:default;}
@@ -437,6 +620,7 @@ textarea.content{min-height:120px;line-height:1.7;}
 .s-card.approved{border-left-color:#42a5f5;}
 .s-card.publishing{border-left-color:#26c6da;}
 .s-card.partial{border-left-color:#ff7043;box-shadow:0 0 0 1px rgba(255,112,67,.18);}
+.s-card.degraded{border-left-color:#ffca28;box-shadow:0 0 0 1px rgba(255,202,40,.16);}
 .s-card.published{border-left-color:#66bb6a;}
 .s-card.cancelled{opacity:.55;border-left-color:#616161;}
 .s-card.hl{animation:hlflash 1.2s ease-in-out 3;}
@@ -448,6 +632,7 @@ textarea.content{min-height:120px;line-height:1.7;}
 .st.approved{background:#0d2137;color:#90caf9;}
 .st.publishing{background:#08303a;color:#80deea;}
 .st.partial{background:#4e2310;color:#ffab91;}
+.st.degraded{background:#3d3208;color:#ffe082;}
 .st.published{background:#1b5e20;color:#a5d6a7;}
 .st.cancelled{background:#21262c;color:#78909c;}
 .pri{font-size:10px;padding:2px 8px;border-radius:6px;background:#16263f;color:#8ba2c8;}
@@ -460,6 +645,28 @@ textarea.content{min-height:120px;line-height:1.7;}
 .reject-box{margin-top:8px;font-size:11px;color:#ffab91;background:#3e2723;border:1px solid rgba(255,138,101,.3);border-radius:8px;padding:7px 10px;}
 .partial-box{margin-top:8px;font-size:11px;color:#ffccbc;background:#3a1c12;border:1px solid rgba(255,112,67,.45);border-radius:8px;padding:8px 11px;line-height:1.7;}
 .partial-box b{color:#ff8a65;}
+.degraded-box{margin-top:8px;font-size:11px;color:#fff3cd;background:#332b0e;border:1px solid rgba(255,202,40,.5);border-radius:8px;padding:8px 11px;line-height:1.7;}
+.degraded-box b{color:#ffe082;}
+.degraded-box .dg-note{margin-top:5px;color:#e6d49a;background:#2a240d;border-radius:6px;padding:5px 8px;}
+.degrade-policy{margin-top:8px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;font-size:10px;color:#c8b87a;background:#241f0c;border:1px solid rgba(255,202,40,.25);border-radius:8px;padding:6px 10px;}
+.degrade-policy.locked{opacity:.85;}
+.degrade-policy .dp-tag{color:#ffe082;font-weight:600;}
+.degrade-policy b{color:#ffe082;}
+.degrade-policy i{color:#ffe082;font-style:normal;}
+.op.dp-edit{padding:2px 9px;font-size:10px;border-color:rgba(255,202,40,.5);color:#ffe082;}
+.inline-btn{background:rgba(255,202,40,.16);border:1px solid rgba(255,202,40,.6);color:#ffe082;border-radius:6px;padding:1px 8px;font-size:11px;cursor:pointer;font-family:inherit;}
+.ch-block.degraded{border-color:rgba(255,202,40,.35);}
+.dg-fields{display:flex;flex-direction:column;gap:8px;width:100%;}
+.dg-fields input[type=range]{width:100%;accent-color:#ffca28;}
+.dg-elig{font-size:12px;color:#ffe082;background:#2e2810;border:1px solid rgba(255,202,40,.3);border-radius:8px;padding:8px 10px;}
+.dg-elig i{font-style:normal;color:#ffe082;}
+.dg-warn{font-size:11px;color:#e6d49a;line-height:1.7;margin:0;background:#241f0c;border-radius:8px;padding:8px 10px;}
+.degrade-btn{background:#b8860b;border-color:#b8860b;}
+.save.degrade-btn{background:linear-gradient(135deg,#f9a825,#f57f17);}
+.slog.degraded .lg-act{color:#ffe082;border-color:rgba(255,202,40,.5);background:#332b0e;}
+.slog.degrade_policy .lg-act{color:#ffe082;border-color:rgba(255,202,40,.4);}
+.slog.notify_degrade .lg-act,.slog.notify_degraded .lg-act{color:#ffe082;border-color:rgba(255,202,40,.4);background:#2e2810;}
+.slog.migrate_degrade .lg-act{color:#c8b87a;border-color:rgba(255,202,40,.3);}
 .s-body{margin-top:8px;display:flex;flex-direction:column;gap:8px;}
 .content-text{white-space:pre-wrap;margin:0;color:#c6d2e8;font-size:12px;line-height:1.75;background:#0c1730;border:1px solid rgba(120,160,220,0.1);border-radius:8px;padding:10px 12px;max-height:220px;overflow-y:auto;}
 .s-meta{display:flex;gap:16px;flex-wrap:wrap;font-size:10px;color:#5b6f94;margin-top:8px;}

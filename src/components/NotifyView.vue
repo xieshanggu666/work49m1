@@ -131,6 +131,7 @@
               <select v-else-if="subForm.mode==='stmt'" v-model="subForm.stmt_event">
                 <option value="chfail">单渠道发布失败（即时提醒）</option>
                 <option value="partial">部分渠道失败·发布未完成（督办，建议需回执）</option>
+                <option value="degraded">降级发布知会（部分失败但按策略降级，终态知会）</option>
               </select>
               <select v-else v-model="subForm.prop_event">
                 <option value="outbreak">进入爆发期（爆发升级）</option>
@@ -168,7 +169,7 @@
             <div v-for="s in subs" :key="s.id" class="sub" :class="{off:!s.active}">
               <div class="s-head">
                 <b>{{ s.name }}</b>
-                <span class="s-kind">{{ s.stmt_event ? '📢 声明·'+(s.stmt_event==='partial'?'部分失败督办':'渠道失败提醒') : s.ext_event ? '🤝 外部协作·'+(s.ext_event==='escalated'?'紧急升级':'提交到达') : s.prop_event ? '🕸 传播·'+(s.prop_event==='outbreak'?'爆发升级':'异动/激增/KOL') : s.wo_event ? '📋 工单·'+(s.wo_event==='escalated'?'超时升级':'拆分分派') : s.crisis_status ? '🛟 危机·'+crisisStatus[s.crisis_status] : '🚨 预警' }}</span>
+                <span class="s-kind">{{ s.stmt_event ? '📢 声明·'+(s.stmt_event==='partial'?'部分失败督办':s.stmt_event==='degraded'?'降级发布知会':'渠道失败提醒') : s.ext_event ? '🤝 外部协作·'+(s.ext_event==='escalated'?'紧急升级':'提交到达') : s.prop_event ? '🕸 传播·'+(s.prop_event==='outbreak'?'爆发升级':'异动/激增/KOL') : s.wo_event ? '📋 工单·'+(s.wo_event==='escalated'?'超时升级':'拆分分派') : s.crisis_status ? '🛟 危机·'+crisisStatus[s.crisis_status] : '🚨 预警' }}</span>
               </div>
               <small>{{ subDesc(s) }}</small>
               <div class="s-chs">
@@ -264,7 +265,7 @@ function corrShort(c) {
   }
   m = String(c).match(/^stmt(\d+):(\w+)/)
   if (m) {
-    const phase = { partial: '部分失败督办', channels: '渠道失败', ackEsc: '回执升级' }[m[2]] || m[2]
+    const phase = { partial: '部分失败督办', channels: '渠道失败', degraded: '降级发布知会', ackEsc: '回执升级' }[m[2]] || m[2]
     return `声明#${m[1]}·${phase}`
   }
   return c.length > 14 ? c.slice(0, 14) + '…' : c
@@ -277,7 +278,7 @@ function logActionText(a) {
 }
 function subDesc(s) {
   if (s.ext_event) return `外部协作方${s.ext_event === 'escalated' ? '紧急提交（升级督办）' : '提交证据/整改进度'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
-  if (s.stmt_event) return `危机声明${s.stmt_event === 'partial' ? '全部渠道登记完但存在失败（发布未完成、阻塞结案）' : '单个渠道发布失败'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
+  if (s.stmt_event) return `危机声明${s.stmt_event === 'partial' ? '全部渠道登记完但存在失败（发布未完成、阻塞结案）' : s.stmt_event === 'degraded' ? '部分渠道失败后按策略降级发布（终态知会）' : '单个渠道发布失败'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.prop_event) return `传播路径${s.prop_event === 'outbreak' ? '进入爆发期（爆发升级）' : '热度激增 / KOL 加入'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.wo_event) return `协同工单${s.wo_event === 'escalated' ? '超时升级（两级）' : '拆分/分派'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.crisis_status) return `危机进入「${crisisStatus.value[s.crisis_status] || s.crisis_status}」时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`

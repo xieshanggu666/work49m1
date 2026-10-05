@@ -431,7 +431,8 @@ CREATE TABLE IF NOT EXISTS crisis_report_logs (
 CREATE INDEX IF NOT EXISTS idx_report_logs_report ON crisis_report_logs (report_id, id);
 -- ===== 危机声明（公关起草 → 法务审核 → 分渠道发布执行与结果登记） =====
 -- 声明主表：状态机 draft 起草中 → review 待法务审核 → approved 审核通过 → publishing 发布中
---   → published 发布完成（无失败渠道）/ partial 部分渠道失败（发布未完成，阻塞结案，可重试或放弃失败渠道）
+--   → published 发布完成（无失败渠道）/ partial 部分渠道失败（发布未完成，阻塞结案，可重试、放弃失败渠道或按策略降级发布）
+--   → degraded 降级发布（部分渠道失败但已达可发布门槛，终态、不阻塞结案）
 -- （驳回退回 draft；draft/approved/publishing/partial 可取消为 cancelled；全部渠道取消亦为 cancelled），发布进度回写处置工单与危机统一时间线
 CREATE TABLE IF NOT EXISTS crisis_statements (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -441,7 +442,13 @@ CREATE TABLE IF NOT EXISTS crisis_statements (
   content TEXT NOT NULL DEFAULT '',        -- 声明正文（公关起草，驳回后可修改重新送审）
   channels TEXT NOT NULL DEFAULT '[]',     -- 拟发布渠道 key 列表 JSON（weibo/wechat/website/news/video/press）
   priority TEXT NOT NULL DEFAULT 'high',   -- urgent/high/normal
-  status TEXT NOT NULL DEFAULT 'draft',    -- draft/review/approved/publishing/partial/published/cancelled
+  status TEXT NOT NULL DEFAULT 'draft',    -- draft/review/approved/publishing/partial/degraded/published/cancelled
+  degrade_mode TEXT NOT NULL DEFAULT 'strict', -- 失败处理策略 strict 严格（仅重试/放弃）/ manual 手动确认降级 / auto 达门槛自动降级
+  degrade_min_ratio REAL NOT NULL DEFAULT 0.6, -- 降级门槛：成功渠道占比下限（0..1）
+  degrade_required TEXT NOT NULL DEFAULT '[]', -- 降级门槛：必须全部成功的渠道 key 列表 JSON（任一失败则不可降级）
+  degrade_by TEXT NOT NULL DEFAULT '',     -- 降级发布确认人（自动降级为系统）
+  degrade_at TEXT,                         -- 降级发布时间
+  degrade_note TEXT NOT NULL DEFAULT '',   -- 降级发布说明（失败渠道与后续补发安排）
   drafted_by TEXT NOT NULL DEFAULT '',
   drafted_at TEXT,
   submitted_by TEXT NOT NULL DEFAULT '',
@@ -609,6 +616,15 @@ ensureColumn('crisis_closures', 'cancelled_tasks', "cancelled_tasks TEXT NOT NUL
 ensureColumn('crisis_closures', 'guard_snapshot', "guard_snapshot TEXT NOT NULL DEFAULT '{}'")
 // 危机声明关联（工单卡片展示最近一次声明回写的进度）
 ensureColumn('work_orders', 'last_statement_id', 'last_statement_id INTEGER')
+// 危机声明可配置降级发布：失败处理策略 + 降级门槛（成功率/必达渠道）+ 降级确认留痕
+ensureColumn('crisis_statements', 'degrade_mode', "degrade_mode TEXT NOT NULL DEFAULT 'strict'")
+ensureColumn('crisis_statements', 'degrade_min_ratio', 'degrade_min_ratio REAL NOT NULL DEFAULT 0.6')
+ensureColumn('crisis_statements', 'degrade_required', "degrade_required TEXT NOT NULL DEFAULT '[]'")
+ensureColumn('crisis_statements', 'degrade_by', "degrade_by TEXT NOT NULL DEFAULT ''")
+ensureColumn('crisis_statements', 'degrade_at', 'degrade_at TEXT')
+ensureColumn('crisis_statements', 'degrade_note', "degrade_note TEXT NOT NULL DEFAULT ''")
+// stmt_event 订阅扩展：degraded=部分渠道失败后按策略降级发布的知会（区别于 partial 督办）
+// （notify_subs.stmt_event 为 TEXT 列，无需改结构；仅种子新增订阅）
 // ===== 协同调度链路升级：工单与通知共享可追踪状态流 =====
 ensureColumn('crisis_timeline', 'ref_type', "ref_type TEXT NOT NULL DEFAULT ''")
 ensureColumn('crisis_timeline', 'ref_id', 'ref_id INTEGER')
@@ -790,6 +806,30 @@ function migrateStatementStatus() {
   }
 }
 migrateStatementStatus()
+
+// 迁移：历史「部分渠道失败」声明升级为可配置降级发布口径——
+// 回填「手动确认降级」策略，成功率门槛按其当前成功占比（保底至少 1 个成功渠道即可降级），
+// 使历史部分失败记录可一键降级收口；不自动改状态、不取消既有督办，保持原阻断语义直至人工处置。
+function migrateStatementDegrade() {
+  const rows = db.prepare(`SELECT s.id, s.degrade_min_ratio,
+      SUM(CASE WHEN sc.status='success' THEN 1 ELSE 0 END) ok_n,
+      SUM(CASE WHEN sc.status='cancelled' THEN 1 ELSE 0 END) cancel_n,
+      COUNT(*) total
+    FROM crisis_statements s JOIN crisis_statement_channels sc ON sc.statement_id=s.id
+    WHERE s.status='partial' GROUP BY s.id`).all()
+  const upd = db.prepare('UPDATE crisis_statements SET degrade_mode=?, degrade_min_ratio=?, degrade_required=? WHERE id=?')
+  const insLog = db.prepare('INSERT INTO crisis_statement_logs (statement_id,action,detail,operator,time) VALUES (?,?,?,?,?)')
+  const ts = new Date().toLocaleString('zh-CN')
+  for (const r of rows) {
+    // 历史记录无策略记录：给手动降级 + 与当前实况一致的门槛（至少 1 个成功渠道），兼容一键降级
+    const ratio = r.total ? Math.round((Math.max(1, r.ok_n) / r.total) * 100) / 100 : 0
+    upd.run('manual', ratio, '[]', r.id)
+    insLog.run(r.id, 'migrate_degrade',
+      `历史部分失败记录兼容：升级为可配置降级发布（手动确认，成功率门槛 ${Math.round(ratio * 100)}%，无必达渠道），可一键降级收口或继续重试/放弃失败渠道`,
+      '系统', ts)
+  }
+}
+migrateStatementDegrade()
 
 // 迁移：早期版本 import_job_items.idem_key 为全局唯一，跨任务内容去重时同名键会冲突，
 // 重建表去掉该唯一约束（保留 (job_id, seq) 唯一与普通索引）。
@@ -1346,22 +1386,88 @@ function seedStatements() {
   l3.run(s3, 'submit', '提交法务审核，等待法务意见', '李澈', ago(20))
   db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
     .run(c2.id, '声明送审', `声明「关于预售商品发货延迟问题的说明与补偿方案」提交法务审核（提交人：李澈）`, ago(20))
+
+  // S4 门店卫生事件补充说明：部分渠道失败后按「手动确认降级」策略降级发布（演示降级收口终态，不阻塞结案）
+  const s4 = Number(db.prepare(`INSERT INTO crisis_statements
+    (crisis_id,work_order_id,title,content,channels,priority,status,
+     drafted_by,drafted_at,submitted_by,submitted_at,reviewed_by,reviewed_at,review_note,
+     publish_by,publish_at,published_at,
+     degrade_mode,degrade_min_ratio,degrade_required,degrade_by,degrade_at,degrade_note,created,updated)
+    VALUES (?,?,?,?,?,?,'degraded',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    c1.id, null,
+    '某连锁品牌门店卫生事件处置进展（补充说明）',
+    '一、全国门店食品安全专项自查已覆盖 80%，未发现其他门店存在同类操作问题；\n二、第三方检测机构现场采样完成，检测报告出具后将第一时间通过官方渠道公布；\n三、欢迎消费者与媒体继续监督，我们将以最严谨态度完成全部整改。',
+    JSON.stringify(['weibo', 'wechat', 'website', 'news', 'video']), 'high',
+    '李澈', ago(130), '李澈', ago(125), '陈律', ago(115), '进展表述与既有口径一致，同意发布；检测结论仍须以正式报告为准。',
+    '张岚', ago(100), ago(15),
+    'manual', 0.6, JSON.stringify(['weibo']), '张岚', ago(15),
+    '新闻通稿媒体邮箱组故障、短视频账号平台维护，4/5 个核心渠道（含必达官方微博）已发布，达到降级门槛；失败渠道平台恢复后补发。',
+    ago(140), ago(15)).lastInsertRowid)
+  const c4 = db.prepare(`INSERT INTO crisis_statement_channels
+    (statement_id,channel,channel_name,assignee,status,result,published_url,fail_reason,attempts,registered_by,registered_at,published_at,created,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const t4 = ago(100)
+  c4.run(s4, 'weibo', '官方微博', '李澈', 'success',
+    '官方微博已发布补充说明并置顶。', 'https://weibo.com/demo/status/s4wb', '', 1, '李澈', ago(70), ago(70), t4, ago(70))
+  c4.run(s4, 'wechat', '微信公众号', '李澈', 'success',
+    '微信公众号推文已群发。', 'https://mp.weixin.qq.com/s/s4', '', 1, '李澈', ago(65), ago(65), t4, ago(65))
+  c4.run(s4, 'website', '官网新闻中心', '张岚', 'success',
+    '官网进展说明已上线。', 'https://brand.com/news/s4', '', 1, '张岚', ago(60), ago(60), t4, ago(60))
+  c4.run(s4, 'news', '新闻通稿（媒体邮箱组）', '张岚', 'failed',
+    '', '', '媒体邮箱组网关故障退信，待网关恢复后补发。', 2, '张岚', ago(35), null, t4, ago(35))
+  c4.run(s4, 'video', '官方短视频账号', '李澈', 'failed',
+    '', '', '短视频平台账号处于年度维护期，暂不可发布，恢复后补发。', 1, '李澈', ago(30), null, t4, ago(30))
+  const l4 = db.prepare('INSERT INTO crisis_statement_logs (statement_id,action,detail,operator,time) VALUES (?,?,?,?,?)')
+  l4.run(s4, 'create', '公关起草处置进展补充说明（高优），拟定发布渠道：官方微博、微信公众号、官网、新闻通稿、官方短视频', '李澈', ago(130))
+  l4.run(s4, 'submit', '提交法务审核', '李澈', ago(125))
+  l4.run(s4, 'approve', '法务审核通过：进展表述与既有口径一致，检测结论以正式报告为准', '陈律', ago(115))
+  l4.run(s4, 'publish', '发起分渠道发布，5 个渠道待执行；失败处理策略：手动确认降级，成功率门槛 60%，必达渠道 官方微博', '张岚', ago(100))
+  l4.run(s4, 'channel_result', '【官方微博】【微信公众号】【官网新闻中心】发布成功', '李澈', ago(60))
+  l4.run(s4, 'channel_result', '【新闻通稿】发布失败：媒体邮箱组网关故障（第 2 次尝试仍失败）', '张岚', ago(35))
+  l4.run(s4, 'channel_result', '【官方短视频账号】发布失败：平台年度维护', '李澈', ago(30))
+  l4.run(s4, 'partial', '全部 5 个渠道执行登记完成但存在失败：成功 3、失败 2，发布未完成（已达降级门槛，可手动确认降级发布）', '系统', ago(28))
+  l4.run(s4, 'degrade_policy', '降级发布策略：手动确认降级，成功率门槛 60%，必达渠道 官方微博', '张岚', ago(100))
+  l4.run(s4, 'degraded', '降级发布：3/5 个渠道已发布（成功率 60%，门槛 60%）、失败 2（人工确认降级）；说明：新闻通稿媒体邮箱组故障、短视频账号平台维护，4/5 个核心渠道（含必达官方微博）已发布，失败渠道平台恢复后补发。', '张岚', ago(15))
+  l4.run(s4, 'notify_degrade', '降级发布：中止在途部分失败督办通知 1 个任务，改发生效知会', '系统', ago(15))
+  db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
+    .run(c1.id, '声明部分失败', '声明「某连锁品牌门店卫生事件处置进展（补充说明）」分渠道发布未完成：3/5 个渠道已发布，2 个渠道失败；失败渠道须重试成功、放弃（取消）或按策略降级后才能结案', ago(28))
+  db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
+    .run(c1.id, '声明降级发布',
+      '声明「某连锁品牌门店卫生事件处置进展（补充说明）」按人工确认降级发布：3/5 个渠道已发布，2 个渠道失败，已达降级门槛（成功率≥60%，必达渠道全部发布），声明视为发布完成、不再阻塞结案；新闻通稿与短视频渠道待平台恢复后补发。',
+      ago(15))
 }
 seedStatements()
 
-// 危机声明通知订阅（独立幂等：渠道发布失败即时提醒 + 部分失败督办需回执）
+// 危机声明通知订阅（独立幂等：渠道发布失败即时提醒 + 部分失败督办需回执 + 降级发布知会）
 function seedStatementSubs() {
-  const n = db.prepare("SELECT COUNT(*) c FROM notify_subs WHERE stmt_event!=''").get().c
-  if (n > 0) return
   const nowStr = new Date().toLocaleString('zh-CN')
   const ch1 = db.prepare("SELECT id FROM notify_channels WHERE name='值班 Webhook'").get()
   const ch4 = db.prepare("SELECT id FROM notify_channels WHERE name='升级专线'").get()
+  const ch2 = db.prepare("SELECT id FROM notify_channels WHERE name='危机邮箱组'").get()
+  // 老库升级：已存在任一 stmt 订阅时，仅独立补齐缺失的「降级发布知会」（新增事件维度），其余订阅保持现状
+  const hasAny = db.prepare("SELECT COUNT(*) c FROM notify_subs WHERE stmt_event!=''").get().c
+  if (hasAny > 0) {
+    const hasDegraded = db.prepare("SELECT COUNT(*) c FROM notify_subs WHERE stmt_event='degraded'").get().c
+    if (!hasDegraded && ch1) {
+      db.prepare(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,active,created,created_by,stmt_event)
+        VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?)`)
+        .run('声明降级发布知会', null, '', '', '',
+          JSON.stringify([ch1.id, ch2 ? ch2.id : ch1.id].filter((v, i, a) => a.indexOf(v) === i)),
+          0, 30, null, 3, nowStr, '系统升级补齐', 'degraded')
+    }
+    return
+  }
   const ss = db.prepare(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,active,created,created_by,stmt_event)
     VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?)`)
   // 单个渠道登记失败 → 值班 Webhook 即时提醒（可重试/放弃）
   if (ch1) ss.run('声明渠道发布失败提醒', null, '', '', '', JSON.stringify([ch1.id]), 0, 30, null, 3, nowStr, '系统初始化', 'chfail')
   // 全部渠道登记完但存在失败（发布未完成、阻塞结案）→ 升级专线督办，需回执 1 分钟超时升级
   if (ch4) ss.run('声明部分渠道失败督办', null, '', '', '', JSON.stringify([ch4.id]), 1, 1, ch4.id, 3, nowStr, '系统初始化', 'partial')
+  // 部分渠道失败后按策略降级发布（终态知会，非催办）→ 值班 Webhook + 危机邮箱组
+  if (ch1) {
+    ss.run('声明降级发布知会', null, '', '', '', JSON.stringify([ch1.id, ch2 ? ch2.id : ch1.id].filter((v, i, a) => a.indexOf(v) === i)),
+      0, 30, null, 3, nowStr, '系统初始化', 'degraded')
+  }
 }
 seedStatementSubs()
 

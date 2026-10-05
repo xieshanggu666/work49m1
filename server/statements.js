@@ -1,6 +1,6 @@
 import { db } from './db.js'
 import { now, addTimeline } from './pipeline.js'
-import { generateForStatement, deleteNotifyOfStatement } from './notify.js'
+import { generateForStatement, deleteNotifyOfStatement, settleStatementPartialNotify } from './notify.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -9,13 +9,18 @@ const run = (sql, ...p) => db.prepare(sql).run(...p)
 // ===== 常量与口径 =====
 export const STMT_STATUS = {
   draft: '起草中', review: '待法务审核', approved: '审核通过',
-  publishing: '发布中', partial: '部分渠道失败', published: '已发布', cancelled: '已取消'
+  publishing: '发布中', partial: '部分渠道失败', degraded: '降级发布',
+  published: '已发布', cancelled: '已取消'
 }
 // 声明未完结口径（危机结案守卫/看板/复盘快照共用）：
-// partial=全部渠道已登记但仍有失败渠道，发布未完成，必须重试成功或放弃（取消）失败渠道后才能结案
+// partial=全部渠道已登记但仍有失败渠道，发布未完成，必须重试成功/放弃（取消）失败渠道，或按降级策略确认降级后才能结案；
+// degraded=部分渠道失败但已达降级门槛并确认（或自动）降级发布，属于终态，不阻塞结案。
 const OPEN_STATUSES = ['draft', 'review', 'approved', 'publishing', 'partial']
 export const isStatementOpen = (status) => OPEN_STATUSES.includes(status)
 export const STMT_PRIORITY = { urgent: '紧急', high: '高', normal: '普通' }
+// 部分渠道失败时的降级发布策略（发起发布时配置，发布中/部分失败时可由 ops 调整）
+export const DEGRADE_MODE = { strict: '严格模式（不降级，仅重试/放弃）', manual: '手动确认降级', auto: '达门槛自动降级' }
+export const DEGRADE_DEFAULT_RATIO = 0.6
 // 拟发布渠道（分渠道执行登记）：与舆情渠道语义对应
 export const STMT_CHANNELS = {
   weibo: '官方微博', wechat: '微信公众号', website: '官网新闻中心',
@@ -30,6 +35,49 @@ function addLog(stmtId, action, detail, operator = '系统') {
 
 function safeParse(s, dft) { try { return JSON.parse(s || '') ?? dft } catch { return dft } }
 
+// 降级策略归一化：mode 三选一；ratio 限制 0..1；required 仅取合法渠道
+export function normDegrade(body = {}, fallback = {}) {
+  const mode = DEGRADE_MODE[body.degrade_mode] ? body.degrade_mode : (DEGRADE_MODE[fallback.degrade_mode] ? fallback.degrade_mode : 'strict')
+  let ratio = body.degrade_min_ratio !== undefined ? Number(body.degrade_min_ratio)
+    : (fallback.degrade_min_ratio !== undefined && fallback.degrade_min_ratio !== null ? Number(fallback.degrade_min_ratio) : DEGRADE_DEFAULT_RATIO)
+  if (!Number.isFinite(ratio)) ratio = DEGRADE_DEFAULT_RATIO
+  ratio = Math.max(0, Math.min(1, ratio))
+  const rawRequired = body.degrade_required !== undefined ? body.degrade_required : safeParse(fallback.degrade_required, [])
+  const required = Array.isArray(rawRequired)
+    ? [...new Set(rawRequired.map((x) => String(x || '').trim()).filter((x) => STMT_CHANNELS[x]))]
+    : []
+  return { mode, ratio: Math.round(ratio * 100) / 100, required }
+}
+
+// 降级门槛判定（全渠道已到终态、存在失败时）：至少 1 个成功渠道 + 成功率达标 + 必达渠道全部成功
+// 返回 { ok, ratio, required, failedRequired, reason }
+export function degradeEligibility(s, rows) {
+  const total = rows.length
+  const ok = rows.filter((r) => r.status === 'success').length
+  const failed = rows.filter((r) => r.status === 'failed').length
+  const required = safeParse(s.degrade_required, [])
+  const failedRequired = rows.filter((r) => r.status !== 'success' && required.includes(r.channel)).map((r) => r.channel)
+  const ratio = total ? ok / total : 0
+  let ok2 = true
+  const reasons = []
+  if (ok < 1) {
+    ok2 = false
+    reasons.push('没有任何渠道发布成功，不具备降级发布的最低覆盖')
+  }
+  if (!(total > 0 && ratio + 1e-9 >= (s.degrade_min_ratio ?? DEGRADE_DEFAULT_RATIO))) {
+    ok2 = false
+    reasons.push(`成功渠道占比 ${Math.round(ratio * 100)}% 未达门槛 ${Math.round((s.degrade_min_ratio ?? DEGRADE_DEFAULT_RATIO) * 100)}%`)
+  }
+  if (failedRequired.length) {
+    ok2 = false
+    reasons.push(`必达渠道未全部发布：${failedRequired.map((k) => STMT_CHANNELS[k] || k).join('、')}`)
+  }
+  return {
+    ok: ok2, ratio: Math.round(ratio * 100) / 100, okCount: ok, failed, total,
+    required, failedRequired, reason: reasons.join('；')
+  }
+}
+
 // ===== 查询 =====
 function decorate(s) {
   const channels = safeParse(s.channels, [])
@@ -39,9 +87,17 @@ function decorate(s) {
   const open = counts.pending + counts.publishing
   // 完成度口径：成功 / 已执行（成功+失败+取消，不含待执行/执行中）
   const finished = counts.success + counts.failed + counts.cancelled
+  const degradeRequired = safeParse(s.degrade_required, [])
+  // 部分失败时按当前渠道实况预演降级门槛（前端展示「可/不可降级」与原因；终态后固定）
+  const eligibility = s.status === 'partial'
+    ? degradeEligibility({ degrade_min_ratio: s.degrade_min_ratio, degrade_required: s.degrade_required }, rows)
+    : null
   return {
     ...s,
     channels,
+    degradeRequired,
+    degradeModeText: DEGRADE_MODE[s.degrade_mode] || s.degrade_mode,
+    degradeEligibility: eligibility,
     statusText: STMT_STATUS[s.status] || s.status,
     priorityText: STMT_PRIORITY[s.priority] || s.priority,
     channelRows: rows.map((r) => ({ ...r, channelText: STMT_CHANNELS[r.channel] || r.channel_name || r.channel, statusText: CH_STATUS[r.status] || r.status })),
@@ -78,26 +134,27 @@ export function getStatement(id) {
 // 看板汇总
 export function statementSummary() {
   const rows = q('SELECT status, COUNT(*) c FROM crisis_statements GROUP BY status')
-  const counts = { draft: 0, review: 0, approved: 0, publishing: 0, partial: 0, published: 0, cancelled: 0 }
+  const counts = { draft: 0, review: 0, approved: 0, publishing: 0, partial: 0, degraded: 0, published: 0, cancelled: 0 }
   for (const r of rows) counts[r.status] = r.c
   const ch = q1(`SELECT
       (SELECT COUNT(*) FROM crisis_statement_channels WHERE status IN ('pending','publishing')) openCh,
       (SELECT COUNT(*) FROM crisis_statement_channels WHERE status='failed') failedCh`)
   return {
     counts,
-    total: counts.draft + counts.review + counts.approved + counts.publishing + counts.partial + counts.published + counts.cancelled,
+    total: counts.draft + counts.review + counts.approved + counts.publishing + counts.partial + counts.degraded + counts.published + counts.cancelled,
     review: counts.review, publishing: counts.publishing + counts.partial,
+    degraded: counts.degraded,
     channelOpen: ch.openCh, channelFailed: ch.failedCh
   }
 }
 
-// 危机卡片角标：该危机最新一份未完结声明
+// 危机卡片角标：该危机最新一份未完结声明（降级发布/已发布/已取消为终态，不再作为未完结角标）
 export function crisisStatementBrief(crisisId) {
   const s = q1('SELECT id,title,status,updated FROM crisis_statements WHERE crisis_id=? ORDER BY id DESC LIMIT 1', crisisId)
   return s ? { ...s, statusText: STMT_STATUS[s.status] || s.status } : null
 }
 
-// 危机下未完结（进行中）声明数（结案守卫/看板口径）：含部分渠道失败（partial，发布未完成）
+// 危机下未完结（进行中）声明数（结案守卫/看板口径）：含部分渠道失败（partial，发布未完成），不含已降级发布（degraded）
 export function crisisOpenStatementCount(crisisId) {
   return q1("SELECT COUNT(*) c FROM crisis_statements WHERE crisis_id=? AND status IN ('draft','review','approved','publishing','partial')", crisisId).c
 }
@@ -117,7 +174,9 @@ function syncProgress(stmtId, action, note, { woRole = '' } = {}) {
 
 // 重算分渠道完成度：
 //   · 全部渠道成功（或成功+取消，无失败、无在途）→ published 已发布
-//   · 全部渠道到达终态但存在失败 → partial 部分渠道失败（发布未完成，阻塞结案，触发督办通知）
+//   · 全部渠道到达终态但存在失败：
+//       auto 策略且达到降级门槛 → degraded 降级发布（终态、不阻塞结案，知会通知，自动取消在途督办）
+//       其余（strict / manual，或 auto 但未达门槛）→ partial 部分渠道失败（阻塞结案，触发督办通知；可手动降级/重试/放弃）
 //   · 全部渠道取消（无一成功/失败/在途）→ cancelled 整份声明取消
 //   · 仍有待执行/执行中渠道 → 保持 publishing
 function recomputePublishing(stmtId, operator = '系统') {
@@ -143,13 +202,28 @@ function recomputePublishing(stmtId, operator = '系统') {
   }
 
   if (failed > 0) {
-    // 部分失败：保持发布未完结（partial），阻断结案，等待重试成功或放弃（取消）失败渠道
+    const elig = degradeEligibility(s, rows)
+    // auto 策略 + 达到降级门槛 → 自动降级发布
+    if (s.degrade_mode === 'auto' && elig.ok) {
+      applyDegraded(stmtId, {
+        ...elig, cancelled, rows, auto: true,
+        note: '全部渠道执行登记完成，失败渠道数在降级发布允许范围内，按「达门槛自动降级」策略自动降级发布'
+      }, '系统')
+      return
+    }
+    // 部分失败：保持发布未完结（partial），阻断结案，等待重试成功、放弃（取消）失败渠道或手动确认降级
     run("UPDATE crisis_statements SET status='partial', published_at=NULL, updated=? WHERE id=?", ts, stmtId)
+    const modeHint = s.degrade_mode === 'auto'
+      ? `（自动降级门槛未满足：${elig.reason}，仍须重试或放弃失败渠道）`
+      : s.degrade_mode === 'manual'
+        ? (elig.ok ? '（已达降级门槛，可手动确认降级发布）' : `（手动降级门槛未满足：${elig.reason}）`)
+        : '（严格模式：仅可重试成功或放弃失败渠道）'
     addLog(stmtId, 'partial',
-      `全部 ${rows.length} 个渠道执行登记完成但存在失败：成功 ${ok}、失败 ${failed}` + (cancelled ? `、取消 ${cancelled}` : '') + '，发布未完成（需重试成功或放弃失败渠道）',
+      `全部 ${rows.length} 个渠道执行登记完成但存在失败：成功 ${ok}、失败 ${failed}` + (cancelled ? `、取消 ${cancelled}` : '') +
+      `，发布未完成${modeHint}`,
       operator)
     const note = `声明「${s.title}」分渠道发布未完成：${ok}/${rows.length} 个渠道已发布，${failed} 个渠道失败` +
-      (cancelled ? `、${cancelled} 个取消` : '') + '；失败渠道须重试成功或放弃（取消）后才能结案'
+      (cancelled ? `、${cancelled} 个取消` : '') + '；失败渠道须重试成功、放弃（取消）或按策略降级后才能结案'
     if (c && c.status !== 'closed') addTimeline(s.crisis_id, '声明部分失败', note, ts)
     if (s.work_order_id) {
       run('INSERT INTO work_order_logs (wo_id,action,detail,operator,operator_role,time) VALUES (?,?,?,?,?,?)',
@@ -172,6 +246,95 @@ function recomputePublishing(stmtId, operator = '系统') {
     run('INSERT INTO work_order_logs (wo_id,action,detail,operator,operator_role,time) VALUES (?,?,?,?,?,?)',
       s.work_order_id, 'stmt', note, operator, '', ts)
   }
+}
+
+// ===== 手动确认降级发布（partial + 达到该声明配置门槛 → degraded 终态） =====
+// 由 ops 值班员操作；调用前可在 body 中临时收紧/调整门槛（degrade_min_ratio/degrade_required），但不满足时返回 400。
+export function confirmDegrade(stmtId, body, actor) {
+  const s = q1('SELECT * FROM crisis_statements WHERE id=?', stmtId)
+  if (!s) return null
+  if (s.status !== 'partial') return { error: `仅「部分渠道失败」的声明可确认降级发布（当前：${STMT_STATUS[s.status]}）` }
+  const rows = q('SELECT * FROM crisis_statement_channels WHERE statement_id=?', stmtId)
+  if (rows.some((r) => ['pending', 'publishing'].includes(r.status))) return { error: '仍有渠道在执行中，请全部登记到终态后再降级' }
+  // 允许在确认时调整门槛（同一套归一化与落库），以最新配置做判定
+  const dg = normDegrade(body || {}, s)
+  const elig = degradeEligibility({ degrade_min_ratio: dg.ratio, degrade_required: JSON.stringify(dg.required) }, rows)
+  if (!elig.ok) return { error: `不满足降级发布门槛：${elig.reason}；请重试成功、放弃更多失败渠道或调整降级门槛` }
+  const note = String(body?.note || '').trim()
+  return applyDegraded(stmtId, { ...elig, cancelled: rows.filter((r) => r.status === 'cancelled').length, rows, auto: false, note, policy: dg }, actor.user)
+}
+
+// ===== 降级策略调整（发布中/部分失败时 ops 可改；auto 门槛可能立即触发自动降级判定） =====
+export function updateDegradePolicy(stmtId, body, actor) {
+  const s = q1('SELECT * FROM crisis_statements WHERE id=?', stmtId)
+  if (!s) return null
+  if (!['approved', 'publishing', 'partial'].includes(s.status)) {
+    return { error: `仅审核通过/发布中/部分失败的声明可配置降级策略（当前：${STMT_STATUS[s.status]}）` }
+  }
+  const dg = normDegrade(body || {}, s)
+  const ts = now()
+  run('UPDATE crisis_statements SET degrade_mode=?, degrade_min_ratio=?, degrade_required=?, updated=? WHERE id=?',
+    dg.mode, dg.ratio, JSON.stringify(dg.required), ts, stmtId)
+  const detail = `降级发布策略调整为：${DEGRADE_MODE[dg.mode]}，成功率门槛 ${Math.round(dg.ratio * 100)}%` +
+    (dg.required.length ? `，必达渠道 ${dg.required.map((k) => STMT_CHANNELS[k]).join('、')}` : '，无必达渠道')
+  addLog(stmtId, 'degrade_policy', detail, actor.user)
+  // partial 状态下改为 auto 且当前实况已达门槛 → 立即自动降级收口
+  if (s.status === 'partial' && dg.mode === 'auto') {
+    const rows = q('SELECT * FROM crisis_statement_channels WHERE statement_id=?', stmtId)
+    const elig = degradeEligibility({ degrade_min_ratio: dg.ratio, degrade_required: JSON.stringify(dg.required) }, rows)
+    if (elig.ok && !rows.some((r) => ['pending', 'publishing'].includes(r.status))) {
+      return { ok: true, degraded: true, result: applyDegraded(stmtId, { ...elig, cancelled: rows.filter((x) => x.status === 'cancelled').length, rows, auto: true, note: '降级策略切换为自动且当前已达门槛，立即降级发布' }, '系统') }
+    }
+  }
+  return { ok: true, degraded: false }
+}
+
+// 降级收口（手动确认/自动共用）：置 degraded 终态 → 取消在途部分失败督办 → 生成降级知会 → 时间线/工单留痕。
+// 调用方已完成门槛校验。返回 { ok:true, degraded:true, ...统计 }。
+function applyDegraded(stmtId, info, operator) {
+  const s = q1('SELECT * FROM crisis_statements WHERE id=?', stmtId)
+  const ts = now()
+  const note = (info.note || '').trim()
+  db.exec('BEGIN')
+  try {
+    run(`UPDATE crisis_statements SET status='degraded', published_at=?, degrade_by=?, degrade_at=?, degrade_note=?, updated=? WHERE id=?`,
+      ts, operator || '系统', ts, note, ts, stmtId)
+    addLog(stmtId, 'degraded',
+      `降级发布：${info.okCount}/${info.total} 个渠道已发布（成功率 ${Math.round(info.ratio * 100)}%，门槛 ${Math.round((s.degrade_min_ratio ?? DEGRADE_DEFAULT_RATIO) * 100)}%）、失败 ${info.failed}` +
+      (info.cancelled ? `、取消 ${info.cancelled}` : '') +
+      (info.failedRequired && info.failedRequired.length ? '' : '') + (note ? `；说明：${note}` : '') +
+      (info.auto ? '（按策略自动降级）' : '（人工确认降级）'),
+      operator)
+    const c = q1('SELECT status FROM crisis WHERE id=?', s.crisis_id)
+    const tlNote = `声明「${s.title}」按${info.auto ? '自动降级策略' : '人工确认'}降级发布：${info.okCount}/${info.total} 个渠道已发布，${info.failed} 个渠道失败${info.cancelled ? `、${info.cancelled} 个取消` : ''}，` +
+      `已达降级门槛（成功率≥${Math.round((s.degrade_min_ratio ?? DEGRADE_DEFAULT_RATIO) * 100)}%${info.required && info.required.length ? '，必达渠道全部发布' : ''}），声明视为发布完成、不再阻塞结案` +
+      (note ? `；${note}` : '')
+    if (c && c.status !== 'closed') addTimeline(s.crisis_id, '声明降级发布', tlNote, ts)
+    if (s.work_order_id) {
+      run('INSERT INTO work_order_logs (wo_id,action,detail,operator,operator_role,time) VALUES (?,?,?,?,?,?)',
+        s.work_order_id, 'stmt', tlNote, operator, '', ts)
+      run('UPDATE work_orders SET last_statement_id=? WHERE id=?', stmtId, s.work_order_id)
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
+    throw e
+  }
+  // ① 取消仍在途的「部分失败督办」通知（待发送/失败/暂停/待回执/已升级），降级后不再催办；单渠道失败提醒已送达的保留可审计
+  let cancelledTasks = 0
+  try { cancelledTasks = settleStatementPartialNotify(stmtId, operator) } catch (e) { console.error('[STMT] 降级取消督办通知失败：', e.message) }
+  addLog(stmtId, 'notify_degrade', `降级发布：中止在途部分失败督办通知 ${cancelledTasks} 个任务（含回执升级链），改发生效知会`, operator)
+  // ② 降级发布知会（新 stmt_event=degraded；按声明幂等，复用失败重试/回执超时升级）
+  let notified = 0
+  try {
+    notified = generateForStatement(stmtId, 'degraded', {
+      ok: info.okCount, failed: info.failed, cancelled: info.cancelled || 0,
+      total: info.total, ratio: info.ratio, threshold: s.degrade_min_ratio ?? DEGRADE_DEFAULT_RATIO,
+      auto: !!info.auto, required: info.required || safeParse(s.degrade_required, [])
+    }).length
+  } catch (e) { console.error('[STMT] 降级知会通知生成失败：', e.message) }
+  addLog(stmtId, 'notify_degraded', `降级发布知会已按订阅生成 ${notified} 个任务`, operator)
+  return { ok: true, degraded: true, ok: info.okCount, failed: info.failed, total: info.total, cancelledTasks, notified }
 }
 
 // ===== 创建（公关起草） =====
@@ -282,7 +445,7 @@ export function rejectStatement(id, body, actor) {
   return { ok: true }
 }
 
-// ===== 发起分渠道发布（approved → publishing；落渠道执行行，可在此最终确认渠道清单） =====
+// ===== 发起分渠道发布（approved → publishing；落渠道执行行，可在此最终确认渠道清单与降级策略） =====
 export function startPublishing(id, body, actor) {
   const s = q1('SELECT * FROM crisis_statements WHERE id=?', id)
   if (!s) return null
@@ -290,11 +453,15 @@ export function startPublishing(id, body, actor) {
   // 发起前可最终确认渠道清单（缺省沿用起草时选择）
   const channels = body?.channels ? normChannels(body.channels) : safeParse(s.channels, [])
   if (!channels.length) return { error: '至少需要一个发布渠道' }
+  // 降级发布策略（缺省严格模式；门槛在所选渠道范围内校验）
+  const dg = normDegrade(body || {}, {})
+  if (dg.required.some((k) => !channels.includes(k))) return { error: '必达渠道必须包含在本次发布渠道清单内' }
   const ts = now()
   db.exec('BEGIN')
   try {
-    run("UPDATE crisis_statements SET status='publishing', channels=?, publish_by=?, publish_at=?, updated=? WHERE id=?",
-      JSON.stringify(channels), actor.user, ts, ts, id)
+    run(`UPDATE crisis_statements SET status='publishing', channels=?, publish_by=?, publish_at=?,
+      degrade_mode=?, degrade_min_ratio=?, degrade_required=?, updated=? WHERE id=?`,
+      JSON.stringify(channels), actor.user, ts, dg.mode, dg.ratio, JSON.stringify(dg.required), ts, id)
     for (const key of channels) {
       const exists = q1('SELECT 1 FROM crisis_statement_channels WHERE statement_id=? AND channel=?', id, key)
       if (!exists) {
@@ -302,15 +469,15 @@ export function startPublishing(id, body, actor) {
           VALUES (?,?,?,'pending',?,?,?)`, id, key, STMT_CHANNELS[key], String(body?.assignee || actor.user || ''), ts, ts)
       }
     }
-    addLog(id, 'publish', `发起分渠道发布，${channels.length} 个渠道待执行（执行人：${body?.assignee || actor.user}）`, actor.user)
+    addLog(id, 'publish', `发起分渠道发布，${channels.length} 个渠道待执行（执行人：${body?.assignee || actor.user}）；失败处理策略：${DEGRADE_MODE[dg.mode]}，成功率门槛 ${Math.round(dg.ratio * 100)}%` + (dg.required.length ? `，必达渠道 ${dg.required.map((k) => STMT_CHANNELS[k]).join('、')}` : ''), actor.user)
     const c = q1('SELECT status FROM crisis WHERE id=?', s.crisis_id)
     if (c && c.status !== 'closed') {
       addTimeline(s.crisis_id, '声明发布',
-        `声明「${s.title}」发起分渠道发布：${channels.map((k) => STMT_CHANNELS[k]).join('、')}（发起人：${actor.user}）`, ts)
+        `声明「${s.title}」发起分渠道发布：${channels.map((k) => STMT_CHANNELS[k]).join('、')}（发起人：${actor.user}；失败策略：${DEGRADE_MODE[dg.mode]}）`, ts)
     }
     if (s.work_order_id) {
       run('INSERT INTO work_order_logs (wo_id,action,detail,operator,operator_role,time) VALUES (?,?,?,?,?,?)',
-        s.work_order_id, 'stmt', `关联声明「${s.title}」发起分渠道发布（${channels.length} 个渠道）`, actor.user, actor.assigneeRole || actor.role || '', ts)
+        s.work_order_id, 'stmt', `关联声明「${s.title}」发起分渠道发布（${channels.length} 个渠道，失败策略：${DEGRADE_MODE[dg.mode]}）`, actor.user, actor.assigneeRole || actor.role || '', ts)
       run('UPDATE work_orders SET last_statement_id=? WHERE id=?', id, s.work_order_id)
     }
     db.exec('COMMIT')

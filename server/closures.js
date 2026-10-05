@@ -32,6 +32,10 @@ export function closureReadiness(crisisId) {
   const openStatements = q(
     "SELECT id,title,status FROM crisis_statements WHERE crisis_id=? AND status IN ('draft','review','approved','publishing','partial') ORDER BY id",
     crisisId)
+  // 降级发布（部分渠道失败但已达门槛确认降级）属于发布终态，不阻断结案；单列供守卫清单展示
+  const degradedStatements = q(
+    "SELECT id,title,status FROM crisis_statements WHERE crisis_id=? AND status='degraded' ORDER BY id",
+    crisisId)
   const openSubmissions = q(
     "SELECT id,code,title,status,is_urgent,kind FROM ext_submissions WHERE crisis_id=? AND status IN ('pending','reviewing') ORDER BY is_urgent DESC, id",
     crisisId)
@@ -57,6 +61,7 @@ export function closureReadiness(crisisId) {
     blockers,
     workOrders: openWorkOrders,
     statements: openStatements,
+    degradedStatements,
     submissions: openSubmissions,
     openAlerts,
     inflightTasks,
@@ -64,7 +69,7 @@ export function closureReadiness(crisisId) {
       ? { id: report.id, title: report.title, status: report.status, statusText: REPORT_STATUS[report.status] || report.status,
           version: report.current_version, publishedVersion: report.published_version }
       : null,
-    cascades: { alerts: openAlerts.length, tasks: inflightTasks.length }
+    cascades: { alerts: openAlerts.length, tasks: inflightTasks.length, degradedStatements: degradedStatements.length }
   }
 }
 
@@ -72,7 +77,7 @@ export function closureReadiness(crisisId) {
 export function blockerError(rd) {
   const parts = rd.blockers.map((b) => {
     if (b.key === 'workorder') return `${b.count} 个未完结协同工单（待分派/处理中/已阻塞，请先完成或取消）`
-    if (b.key === 'statement') return `${b.count} 份未完结危机声明（起草/待审/发布中/部分渠道失败，请先完成发布或取消）`
+    if (b.key === 'statement') return `${b.count} 份未完结危机声明（起草/待审/发布中/部分渠道失败，请先完成发布、确认降级或取消）`
     if (b.key === 'external') return `${b.count} 条待审核外部协作提交（待审核/受理中，请先受理后采纳、驳回或由提交方撤回）`
     return '复盘报告尚未审核发布（请完成跨角色编制并由管理员审核通过后再结案）'
   })
@@ -118,7 +123,7 @@ export function closeCrisis(crisisId, rawSummary = '') {
     closedAt: ts,
     prevStatus: c.status,
     workOrders: { open: rd.workOrders.length },
-    statements: { open: rd.statements.length },
+    statements: { open: rd.statements.length, degraded: rd.degradedStatements.length },
     submissions: { open: rd.submissions.length },
     alerts: { open: opens.length, resolved: opens.length },
     notifyTasks: { inflight: tasks.length, cancelled: tasks.length },

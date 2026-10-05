@@ -289,7 +289,21 @@ export const usePubStore = defineStore('pub', {
     async startStatementPublish(id, body) {
       const r = await api(`/statements/${id}/publish`, 'POST', body || {})
       await this.load()
-      this.msg('已发起分渠道发布，等待各渠道执行登记', 'success')
+      const modeText = { strict: '严格模式（不降级）', manual: '手动确认降级', auto: '达门槛自动降级' }[body?.degrade_mode]
+      this.msg(`已发起分渠道发布${modeText ? `，失败策略：${modeText}` : ''}，等待各渠道执行登记`, 'success')
+      return r
+    },
+    async confirmStatementDegrade(id, body) {
+      const r = await api(`/statements/${id}/degrade`, 'POST', body || {})
+      await this.load()
+      this.msg('声明已按降级策略发布完成（不再阻塞结案）', 'success')
+      return r
+    },
+    async updateStatementDegradePolicy(id, body) {
+      const r = await api(`/statements/${id}/degrade-policy`, 'POST', body || {})
+      await this.load()
+      if (!r.degraded) this.msg('降级发布策略已更新', 'success')
+      else this.msg('已达降级门槛，声明自动降级发布完成', 'success')
       return r
     },
     async cancelStatement(id, reason) {

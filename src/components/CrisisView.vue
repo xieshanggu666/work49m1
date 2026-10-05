@@ -128,7 +128,7 @@
                 📝 复盘报告：{{ cl.report_title || review.report?.title }}（v{{ cl.report_version || review.report?.published_version }}）
               </span>
               <span v-if="closureGuard(cl)" class="cl-guard">
-                🛡 结案守卫：工单 {{ closureGuard(cl).workOrders.open }} 在办 · 声明 {{ closureGuard(cl).statements.open }} 在办
+                🛡 结案守卫：工单 {{ closureGuard(cl).workOrders.open }} 在办 · 声明 {{ closureGuard(cl).statements.open }} 在办<template v-if="closureGuard(cl).statements.degraded">（{{ closureGuard(cl).statements.degraded }} 份降级发布放行）</template>
                 · 外部提交 {{ closureGuard(cl).submissions.open }} 待审 · 报告{{ closureGuard(cl).report ? ' 已发布 v' + closureGuard(cl).report.version : '—' }}
               </span>
               <span v-if="closureCascade(cl)" class="cl-cascade">
@@ -157,6 +157,7 @@
               <li :class="{ok: !guardCount('statement'), bad: guardCount('statement')}">
                 <i>{{ guardCount('statement') ? '✕' : '✔' }}</i>危机声明全部发布/取消
                 <b v-if="guardCount('statement')">{{ guardCount('statement') }} 份未完结</b>
+                <b v-else-if="review.readiness.degradedStatements && review.readiness.degradedStatements.length" class="degraded-ok">（{{ review.readiness.degradedStatements.length }} 份降级发布，放行）</b>
                 <button v-if="guardCount('statement')" class="mini-link" @click="gotoStmt(c)">去处理 →</button>
               </li>
               <li :class="{ok: !guardCount('external'), bad: guardCount('external')}">
@@ -370,8 +371,10 @@ textarea{resize:vertical;min-height:52px;}
 .stmt-badge.review{background:#33270e;color:#ffe082;border-color:rgba(255,179,0,.45);}
 .stmt-badge.publishing{background:#08303a;color:#80deea;border-color:rgba(38,198,218,.5);}
 .stmt-badge.partial{background:#3a1c12;color:#ffab91;border-color:rgba(255,112,67,.6);}
+.stmt-badge.degraded{background:#332b0e;color:#ffe082;border-color:rgba(255,202,40,.6);}
 .stmt-badge.published{background:#122e1c;color:#a5d6a7;border-color:rgba(102,187,106,.4);}
 .stmt-badge.draft{background:#263238;color:#b0bec5;border-color:rgba(120,144,156,.4);}
+.degraded-ok{color:#ffe082;font-weight:400;}
 .ext-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#261a3d;color:#ce93d8;border:1px solid rgba(142,36,170,.45);cursor:pointer;}
 .ext-badge.urgent{background:#3d1414;color:#ff8a80;border-color:rgba(239,83,80,.6);animation:extpulse 1.2s infinite;}
 @keyframes extpulse{50%{box-shadow:0 0 0 3px rgba(239,83,80,.18);}}

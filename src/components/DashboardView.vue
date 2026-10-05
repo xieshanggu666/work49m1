@@ -13,7 +13,7 @@
       <div class="stat wo"><span class="s-ic">📋</span><b>{{ s.workOpen ?? 0 }}</b><em>在办工单{{ s.workOverdue ? `（超时 ${s.workOverdue}）` : '' }}{{ s.workEscalated ? ` · 升级 ${s.workEscalated}` : '' }}</em></div>
       <div class="stat notify"><span class="s-ic">📤</span><b>{{ s.notifyAcked ?? 0 }}</b><em>通知已回执{{ s.notifyOpen ? `（在途 ${s.notifyOpen}）` : '' }}</em></div>
       <div v-if="s.notifyRetries || s.notifyEscalated || s.workDispatchStalled" class="stat notify-warn"><span class="s-ic">🔗</span><b>{{ (s.notifyRetries ?? 0) + (s.notifyEscalated ?? 0) }}</b><em>调度重试/升级{{ s.workDispatchStalled ? ` · ${s.workDispatchStalled} 单发送失败` : '' }}</em></div>
-      <div class="stat stmt" :class="{partial:s.stmtPartial}"><span class="s-ic">📢</span><b>{{ (s.stmtReview ?? 0) + (s.stmtPublishing ?? 0) }}</b><em>待办声明{{ s.stmtPartial ? ` · ${s.stmtPartial} 份部分失败` : '' }}{{ s.stmtChannelFailed ? `（${s.stmtChannelFailed} 渠道失败）` : '' }}</em></div>
+      <div class="stat stmt" :class="{partial:s.stmtPartial, degraded:s.stmtDegraded && !s.stmtPartial}"><span class="s-ic">📢</span><b>{{ (s.stmtReview ?? 0) + (s.stmtPublishing ?? 0) }}</b><em>待办声明<template v-if="s.stmtPartial"> · {{ s.stmtPartial }} 份部分失败</template><template v-else-if="s.stmtDegraded"> · {{ s.stmtDegraded }} 份降级发布</template>{{ s.stmtChannelFailed ? `（${s.stmtChannelFailed} 渠道失败）` : '' }}</em></div>
       <div class="stat ext" :class="{warn:s.extUrgentOpen}"><span class="s-ic">🤝</span><b>{{ (s.extPending ?? 0) + (s.extReviewing ?? 0) }}</b><em>外部协作待审{{ s.extUrgentOpen ? `（⚡紧急 ${s.extUrgentOpen}）` : '' }}</em></div>
       <div class="stat prop"><span class="s-ic">🕸</span><b>{{ s.propActive ?? 0 }}</b><em>监测传播路径</em></div>
       <div class="stat prop-out"><span class="s-ic">🔥</span><b>{{ s.propOutbreak ?? 0 }}</b><em>爆发期路径</em></div>
@@ -166,7 +166,7 @@ function statusText(st) { return { monitoring: '监测中', disposal: '处置中
 .stat b{font-size:26px;color:#fff;}.stat em{font-size:11px;color:#8ba2c8;font-style:normal;}
 .s-ic{font-size:20px;}
 .stat.pos b{color:#66bb6a;}.stat.neu b{color:#90a4ae;}.stat.neg b{color:#ef5350;}.stat.warn b{color:#ffb300;}.stat.red b{color:#ef5350;}
-.stat.alarm b{color:#ffab91;}.stat.crisis b{color:#90caf9;}.stat.wo b{color:#80cbc4;}.stat.stmt b{color:#4dd0e1;}.stat.stmt.partial{border-color:rgba(255,112,67,.5);}.stat.stmt.partial b{color:#ff8a65;}.stat.ext b{color:#ce93d8;}.stat.ext.warn b{color:#ff8a80;}
+.stat.alarm b{color:#ffab91;}.stat.crisis b{color:#90caf9;}.stat.wo b{color:#80cbc4;}.stat.stmt b{color:#4dd0e1;}.stat.stmt.partial{border-color:rgba(255,112,67,.5);}.stat.stmt.partial b{color:#ff8a65;}.stat.stmt.degraded{border-color:rgba(255,202,40,.55);}.stat.stmt.degraded b{color:#ffe082;}.stat.ext b{color:#ce93d8;}.stat.ext.warn b{color:#ff8a80;}
 .stat.notify b{color:#a5d6a7;}.stat.notify-warn b{color:#ffcc80;}
 .stat.prop b{color:#80cbc4;}.stat.prop-out b{color:#ef5350;}
 .stat.report b{color:#ce93d8;}.stat.report-rev b{color:#ffcc80;}
