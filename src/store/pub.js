@@ -315,6 +315,27 @@ export const usePubStore = defineStore('pub', {
       this.msg('该渠道已取消', 'info')
       return r
     },
+    // 降级发布（partial → degraded）：失败渠道降级终止并保留记录，不再阻塞结案
+    async degradeStatement(id, reason) {
+      const r = await api(`/statements/${id}/degrade`, 'POST', { reason })
+      await this.load()
+      this.msg('已按降级策略收口发布（失败渠道记录保留，可事后重试补齐）', r.mode === 'auto' ? 'info' : 'success')
+      return r
+    },
+    // 单份声明降级策略覆盖（reset=true 清空覆盖沿用全局默认）
+    async saveStatementDegradePolicy(id, body) {
+      const r = await api(`/statements/${id}/degrade-policy`, 'PUT', body)
+      await this.load()
+      this.msg(body.reset ? '降级策略已改回全局默认' : '该声明的降级策略已更新', 'success')
+      return r
+    },
+    // 全局默认降级策略（仅 admin）
+    async saveGlobalDegradePolicy(body) {
+      const r = await api('/statements-config/degrade-policy', 'PUT', body)
+      await this.load()
+      this.msg('全局声明降级发布策略已更新（对未单独配置的声明生效）', 'success')
+      return r
+    },
     // ===== 外部协作反馈门户（内部审核看板） =====
     async fetchExtSubmissions(filter) { return await api('/ext-submissions', 'GET', null, filter) },
     async fetchExtSubmission(id) { return (await api(`/ext-submissions/${id}`)).submission },

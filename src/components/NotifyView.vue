@@ -131,6 +131,7 @@
               <select v-else-if="subForm.mode==='stmt'" v-model="subForm.stmt_event">
                 <option value="chfail">单渠道发布失败（即时提醒）</option>
                 <option value="partial">部分渠道失败·发布未完成（督办，建议需回执）</option>
+                <option value="degraded">降级发布·失败渠道降级终止（知会留痕）</option>
               </select>
               <select v-else v-model="subForm.prop_event">
                 <option value="outbreak">进入爆发期（爆发升级）</option>
@@ -264,7 +265,7 @@ function corrShort(c) {
   }
   m = String(c).match(/^stmt(\d+):(\w+)/)
   if (m) {
-    const phase = { partial: '部分失败督办', channels: '渠道失败', ackEsc: '回执升级' }[m[2]] || m[2]
+    const phase = { partial: '部分失败督办', channels: '渠道失败', degrade: '降级发布知会', ackEsc: '回执升级' }[m[2]] || m[2]
     return `声明#${m[1]}·${phase}`
   }
   return c.length > 14 ? c.slice(0, 14) + '…' : c
@@ -277,7 +278,7 @@ function logActionText(a) {
 }
 function subDesc(s) {
   if (s.ext_event) return `外部协作方${s.ext_event === 'escalated' ? '紧急提交（升级督办）' : '提交证据/整改进度'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
-  if (s.stmt_event) return `危机声明${s.stmt_event === 'partial' ? '全部渠道登记完但存在失败（发布未完成、阻塞结案）' : '单个渠道发布失败'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
+  if (s.stmt_event) return `危机声明${s.stmt_event === 'partial' ? '全部渠道登记完但存在失败（发布未完成、阻塞结案）' : s.stmt_event === 'degraded' ? '按策略降级发布（失败渠道终止并保留记录）' : '单个渠道发布失败'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.prop_event) return `传播路径${s.prop_event === 'outbreak' ? '进入爆发期（爆发升级）' : '热度激增 / KOL 加入'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.wo_event) return `协同工单${s.wo_event === 'escalated' ? '超时升级（两级）' : '拆分/分派'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.crisis_status) return `危机进入「${crisisStatus.value[s.crisis_status] || s.crisis_status}」时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`

@@ -162,7 +162,7 @@ const totalCount = computed(() => Object.values(summary.value.counts || {}).redu
 function roleText(r) { return { admin: '管理员', ops: '值班员', viewer: '观察员' }[r] || r }
 function roleName(r) { return dict.value.role[r] || r }
 function stText(s) { return { monitoring: '监测中', disposal: '处置中', closed: '已结案' }[s] || s }
-function stmtStatusText(s) { return { draft: '起草中', review: '待法务审核', approved: '审核通过', publishing: '发布中', partial: '部分渠道失败', published: '已发布', cancelled: '已取消' }[s] || s }
+function stmtStatusText(s) { return { draft: '起草中', review: '待法务审核', approved: '审核通过', publishing: '发布中', partial: '部分渠道失败', degraded: '已降级发布', published: '已发布', cancelled: '已取消' }[s] || s }
 // 跳转危机声明页：带所属危机预填起草，并预关联本工单
 function gotoStmt(w) {
   store.stmtDraftCrisis = w.crisis_id

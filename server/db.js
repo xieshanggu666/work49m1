@@ -432,6 +432,7 @@ CREATE INDEX IF NOT EXISTS idx_report_logs_report ON crisis_report_logs (report_
 -- ===== 危机声明（公关起草 → 法务审核 → 分渠道发布执行与结果登记） =====
 -- 声明主表：状态机 draft 起草中 → review 待法务审核 → approved 审核通过 → publishing 发布中
 --   → published 发布完成（无失败渠道）/ partial 部分渠道失败（发布未完成，阻塞结案，可重试或放弃失败渠道）
+--   / degraded 已降级发布（按可配置策略将失败渠道降级终止、保留失败记录，不再阻塞结案；失败渠道仍可重试补齐为 published）
 -- （驳回退回 draft；draft/approved/publishing/partial 可取消为 cancelled；全部渠道取消亦为 cancelled），发布进度回写处置工单与危机统一时间线
 CREATE TABLE IF NOT EXISTS crisis_statements (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -441,7 +442,12 @@ CREATE TABLE IF NOT EXISTS crisis_statements (
   content TEXT NOT NULL DEFAULT '',        -- 声明正文（公关起草，驳回后可修改重新送审）
   channels TEXT NOT NULL DEFAULT '[]',     -- 拟发布渠道 key 列表 JSON（weibo/wechat/website/news/video/press）
   priority TEXT NOT NULL DEFAULT 'high',   -- urgent/high/normal
-  status TEXT NOT NULL DEFAULT 'draft',    -- draft/review/approved/publishing/partial/published/cancelled
+  status TEXT NOT NULL DEFAULT 'draft',    -- draft/review/approved/publishing/partial/degraded/published/cancelled
+  degrade_policy TEXT NOT NULL DEFAULT '', -- 降级发布策略覆盖 JSON（空=沿用全局默认；{mode,maxFailRatio,minSuccess}）
+  degraded_mode TEXT,                      -- 实际降级方式：manual 手动 / auto 自动（仅 degraded 状态，补齐恢复后保留为历史）
+  degraded_at TEXT,                        -- 降级发布时间
+  degraded_by TEXT NOT NULL DEFAULT '',    -- 降级发布操作人（auto=系统）
+  degrade_reason TEXT NOT NULL DEFAULT '', -- 降级发布说明/审批理由
   drafted_by TEXT NOT NULL DEFAULT '',
   drafted_at TEXT,
   submitted_by TEXT NOT NULL DEFAULT '',
@@ -490,6 +496,13 @@ CREATE TABLE IF NOT EXISTS crisis_statement_logs (
   time TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_stmt_logs_stmt ON crisis_statement_logs (statement_id, id);
+-- 全局键值配置：危机声明降级发布默认策略等（缺行时由业务模块按内置默认值回填，保证历史库可用）
+CREATE TABLE IF NOT EXISTS app_config (
+  config_key TEXT PRIMARY KEY,
+  config_value TEXT NOT NULL DEFAULT '',   -- JSON 值
+  updated TEXT NOT NULL,
+  updated_by TEXT NOT NULL DEFAULT ''
+);
 -- ===== 外部协作反馈门户 =====
 -- 外部协作方：品牌方 / 监管方 / 媒体，经口令（access_code）在门户提交证据与整改进度
 CREATE TABLE IF NOT EXISTS ext_partners (
@@ -609,6 +622,12 @@ ensureColumn('crisis_closures', 'cancelled_tasks', "cancelled_tasks TEXT NOT NUL
 ensureColumn('crisis_closures', 'guard_snapshot', "guard_snapshot TEXT NOT NULL DEFAULT '{}'")
 // 危机声明关联（工单卡片展示最近一次声明回写的进度）
 ensureColumn('work_orders', 'last_statement_id', 'last_statement_id INTEGER')
+// 危机声明降级发布扩展：可配置降级策略 + 降级发布留痕字段（历史 partial 声明不带覆盖策略，沿用全局默认=手动/阻断语义不变）
+ensureColumn('crisis_statements', 'degrade_policy', "degrade_policy TEXT NOT NULL DEFAULT ''")
+ensureColumn('crisis_statements', 'degraded_mode', 'degraded_mode TEXT')
+ensureColumn('crisis_statements', 'degraded_at', 'degraded_at TEXT')
+ensureColumn('crisis_statements', 'degraded_by', "degraded_by TEXT NOT NULL DEFAULT ''")
+ensureColumn('crisis_statements', 'degrade_reason', "degrade_reason TEXT NOT NULL DEFAULT ''")
 // ===== 协同调度链路升级：工单与通知共享可追踪状态流 =====
 ensureColumn('crisis_timeline', 'ref_type', "ref_type TEXT NOT NULL DEFAULT ''")
 ensureColumn('crisis_timeline', 'ref_id', 'ref_id INTEGER')
@@ -1349,19 +1368,25 @@ function seedStatements() {
 }
 seedStatements()
 
-// 危机声明通知订阅（独立幂等：渠道发布失败即时提醒 + 部分失败督办需回执）
+// 危机声明通知订阅（独立幂等：渠道发布失败即时提醒 + 部分失败督办需回执 + 降级发布知会）
 function seedStatementSubs() {
-  const n = db.prepare("SELECT COUNT(*) c FROM notify_subs WHERE stmt_event!=''").get().c
-  if (n > 0) return
   const nowStr = new Date().toLocaleString('zh-CN')
   const ch1 = db.prepare("SELECT id FROM notify_channels WHERE name='值班 Webhook'").get()
   const ch4 = db.prepare("SELECT id FROM notify_channels WHERE name='升级专线'").get()
   const ss = db.prepare(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,active,created,created_by,stmt_event)
     VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?)`)
-  // 单个渠道登记失败 → 值班 Webhook 即时提醒（可重试/放弃）
-  if (ch1) ss.run('声明渠道发布失败提醒', null, '', '', '', JSON.stringify([ch1.id]), 0, 30, null, 3, nowStr, '系统初始化', 'chfail')
+  // 单个渠道登记失败 → 值班 Webhook 即时提醒（可重试/放弃/降级）
+  if (ch1 && !db.prepare("SELECT 1 FROM notify_subs WHERE name='声明渠道发布失败提醒'").get()) {
+    ss.run('声明渠道发布失败提醒', null, '', '', '', JSON.stringify([ch1.id]), 0, 30, null, 3, nowStr, '系统初始化', 'chfail')
+  }
   // 全部渠道登记完但存在失败（发布未完成、阻塞结案）→ 升级专线督办，需回执 1 分钟超时升级
-  if (ch4) ss.run('声明部分渠道失败督办', null, '', '', '', JSON.stringify([ch4.id]), 1, 1, ch4.id, 3, nowStr, '系统初始化', 'partial')
+  if (ch4 && !db.prepare("SELECT 1 FROM notify_subs WHERE name='声明部分渠道失败督办'").get()) {
+    ss.run('声明部分渠道失败督办', null, '', '', '', JSON.stringify([ch4.id]), 1, 1, ch4.id, 3, nowStr, '系统初始化', 'partial')
+  }
+  // 按策略降级发布（失败渠道降级终止、声明带失败记录收口、不再阻塞结案）→ 值班 Webhook 知会留痕
+  if (ch1 && !db.prepare("SELECT 1 FROM notify_subs WHERE name='声明降级发布知会'").get()) {
+    ss.run('声明降级发布知会', null, '', '', '', JSON.stringify([ch1.id]), 0, 30, null, 3, nowStr, '系统初始化', 'degraded')
+  }
 }
 seedStatementSubs()
 

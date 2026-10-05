@@ -32,6 +32,10 @@ export function closureReadiness(crisisId) {
   const openStatements = q(
     "SELECT id,title,status FROM crisis_statements WHERE crisis_id=? AND status IN ('draft','review','approved','publishing','partial') ORDER BY id",
     crisisId)
+  // 已降级发布的声明为发布终态（失败渠道按策略降级终止、保留记录），不阻断结案；冻结进守卫快照供回溯
+  const degradedStatements = q(
+    "SELECT id,title,status,degraded_mode,degraded_by,degrade_reason FROM crisis_statements WHERE crisis_id=? AND status='degraded' ORDER BY id",
+    crisisId)
   const openSubmissions = q(
     "SELECT id,code,title,status,is_urgent,kind FROM ext_submissions WHERE crisis_id=? AND status IN ('pending','reviewing') ORDER BY is_urgent DESC, id",
     crisisId)
@@ -57,6 +61,7 @@ export function closureReadiness(crisisId) {
     blockers,
     workOrders: openWorkOrders,
     statements: openStatements,
+    degradedStatements,
     submissions: openSubmissions,
     openAlerts,
     inflightTasks,
@@ -114,11 +119,12 @@ export function closeCrisis(crisisId, rawSummary = '') {
     work_order_id: t.work_order_id ?? null
   }))
   // 守卫快照（冻结结案时点的全量口径，回溯面板展示，与历史空快照档案区分）
+  const degradedStmtCount = q1("SELECT COUNT(*) c FROM crisis_statements WHERE crisis_id=? AND status='degraded'", crisisId).c
   const guardSnapshot = {
     closedAt: ts,
     prevStatus: c.status,
     workOrders: { open: rd.workOrders.length },
-    statements: { open: rd.statements.length },
+    statements: { open: rd.statements.length, degraded: degradedStmtCount },
     submissions: { open: rd.submissions.length },
     alerts: { open: opens.length, resolved: opens.length },
     notifyTasks: { inflight: tasks.length, cancelled: tasks.length },
@@ -157,6 +163,7 @@ export function closeCrisis(crisisId, rawSummary = '') {
     const bits = [summary]
     if (opens.length) bits.push(`同步解除 ${opens.length} 条未解除预警${ruleNames.length ? '：' + ruleNames.join('、') : ''}`)
     if (tasks.length) bits.push(`联动中止 ${tasks.length} 条在途通知任务（回滚结案可恢复）`)
+    if (degradedStmtCount) bits.push(`${degradedStmtCount} 份声明为降级发布（失败渠道已按策略降级终止并保留记录，不阻断结案）`)
     if (rd.report) bits.push(`复盘报告「${rd.report.title}」已发布（v${rd.report.publishedVersion || rd.report.version}）`)
     addTimeline(crisisId, '事件结案', bits.join('（'), ts)
     db.exec('COMMIT')

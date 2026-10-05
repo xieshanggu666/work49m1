@@ -128,7 +128,7 @@
                 📝 复盘报告：{{ cl.report_title || review.report?.title }}（v{{ cl.report_version || review.report?.published_version }}）
               </span>
               <span v-if="closureGuard(cl)" class="cl-guard">
-                🛡 结案守卫：工单 {{ closureGuard(cl).workOrders.open }} 在办 · 声明 {{ closureGuard(cl).statements.open }} 在办
+                🛡 结案守卫：工单 {{ closureGuard(cl).workOrders.open }} 在办 · 声明 {{ closureGuard(cl).statements.open }} 在办<template v-if="closureGuard(cl).statements.degraded"> · 降级发布 {{ closureGuard(cl).statements.degraded }}</template>
                 · 外部提交 {{ closureGuard(cl).submissions.open }} 待审 · 报告{{ closureGuard(cl).report ? ' 已发布 v' + closureGuard(cl).report.version : '—' }}
               </span>
               <span v-if="closureCascade(cl)" class="cl-cascade">
@@ -158,6 +158,7 @@
                 <i>{{ guardCount('statement') ? '✕' : '✔' }}</i>危机声明全部发布/取消
                 <b v-if="guardCount('statement')">{{ guardCount('statement') }} 份未完结</b>
                 <button v-if="guardCount('statement')" class="mini-link" @click="gotoStmt(c)">去处理 →</button>
+                <span v-if="!guardCount('statement') && degradedCount(c)" class="guard-note">{{ degradedCount(c) }} 份降级发布（失败渠道已终止留痕，不阻断结案）</span>
               </li>
               <li :class="{ok: !guardCount('external'), bad: guardCount('external')}">
                 <i>{{ guardCount('external') ? '✕' : '✔' }}</i>外部协作提交全部办结
@@ -296,6 +297,10 @@ function guardCount(key) {
   return { workorder: rd.workOrders.length, statement: rd.statements.length, external: rd.submissions.length }[key] || 0
 }
 const reportPublished = computed(() => review.value?.readiness?.report?.status === 'published')
+// 已降级发布的声明为发布终态（不阻断守卫），在清单中以提示口径展示
+function degradedCount() {
+  return review.value?.readiness?.degradedStatements?.length || 0
+}
 // 历史结案档案的守卫快照（新链路档案有冻结；历史档案为空，面板按可用字段降级展示）
 function closureGuard(cl) {
   if (cl.guard_snapshot && typeof cl.guard_snapshot === 'object') return cl.guard_snapshot
@@ -370,6 +375,7 @@ textarea{resize:vertical;min-height:52px;}
 .stmt-badge.review{background:#33270e;color:#ffe082;border-color:rgba(255,179,0,.45);}
 .stmt-badge.publishing{background:#08303a;color:#80deea;border-color:rgba(38,198,218,.5);}
 .stmt-badge.partial{background:#3a1c12;color:#ffab91;border-color:rgba(255,112,67,.6);}
+.stmt-badge.degraded{background:#221738;color:#b39ddb;border-color:rgba(126,87,194,.6);}
 .stmt-badge.published{background:#122e1c;color:#a5d6a7;border-color:rgba(102,187,106,.4);}
 .stmt-badge.draft{background:#263238;color:#b0bec5;border-color:rgba(120,144,156,.4);}
 .ext-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#261a3d;color:#ce93d8;border:1px solid rgba(142,36,170,.45);cursor:pointer;}
@@ -450,6 +456,7 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .guard-list li.cascade-item{color:#8ba2c8;}
 .guard-list li.cascade-item i{background:#26344e;color:#90caf9;}
 .guard-list li b{color:#ef9a9a;font-size:10px;font-weight:600;}
+.guard-list li b.guard-note,.guard-list li .guard-note{color:#b39ddb;font-size:10px;font-weight:400;background:#221738;border:1px solid rgba(126,87,194,.35);border-radius:5px;padding:1px 7px;}
 .guard-list li.cascade-item b{color:#90caf9;}
 .guard-list .mini-link{padding:0 2px;}
 .close .disabled,

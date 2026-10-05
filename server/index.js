@@ -40,10 +40,11 @@ import {
   approveReport, rejectReport, rollbackReport, deleteReportsOfCrisis, ensureSeedSnapshots
 } from './reports.js'
 import {
-  STMT_STATUS, STMT_PRIORITY, STMT_CHANNELS, CH_STATUS,
+  STMT_STATUS, STMT_PRIORITY, STMT_CHANNELS, CH_STATUS, DEGRADE_MODE_TEXT,
   listStatements, getStatement, statementSummary, crisisStatementBrief,
   createStatement, editStatement, submitStatement, approveStatement, rejectStatement,
   startPublishing, registerChannel, retryChannel, cancelChannel, cancelStatement,
+  degradeStatement, updateStatementPolicy, getGlobalDegradePolicy, updateGlobalDegradePolicy,
   deleteStatementsOfCrisis
 } from './statements.js'
 import {
@@ -169,7 +170,8 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM crisis_statements WHERE status IN ('publishing','partial')) stmtPublishing,
     (SELECT COUNT(*) FROM crisis_statements WHERE status='partial') stmtPartial,
     (SELECT COUNT(*) FROM crisis_statement_channels WHERE status IN ('pending','publishing')) stmtChannelOpen,
-    (SELECT COUNT(*) FROM crisis_statement_channels WHERE status='failed') stmtChannelFailed,
+    (SELECT COUNT(*) FROM crisis_statement_channels WHERE status='failed'
+      AND statement_id IN (SELECT id FROM crisis_statements WHERE status='partial')) stmtChannelFailed,
     (SELECT COUNT(*) FROM ext_submissions WHERE status='pending') extPending,
     (SELECT COUNT(*) FROM ext_submissions WHERE status='reviewing') extReviewing,
     (SELECT COUNT(*) FROM ext_submissions WHERE is_urgent=1 AND status IN ('pending','reviewing')) extUrgentOpen,
@@ -1009,7 +1011,8 @@ app.get('/api/statements', (req, res) => {
       crisisId: req.query.crisis_id ? +req.query.crisis_id : null
     }),
     summary: statementSummary(),
-    dict: { status: STMT_STATUS, priority: STMT_PRIORITY, channels: STMT_CHANNELS, channelStatus: CH_STATUS },
+    dict: { status: STMT_STATUS, priority: STMT_PRIORITY, channels: STMT_CHANNELS, channelStatus: CH_STATUS, degradeMode: DEGRADE_MODE_TEXT },
+    degradePolicy: getGlobalDegradePolicy(),
     actor: actorOf(req)
   })
 })
@@ -1066,6 +1069,29 @@ app.post('/api/statements/:id/cancel', guard('ops'), (req, res) => {
   if (!r) return res.status(404).json({ error: '危机声明不存在' })
   if (r.error) return res.status(400).json({ error: r.error })
   res.json(r)
+})
+// 手动降级发布（partial → degraded；失败渠道保留失败记录、不再阻塞结案，按生效策略校验门槛）
+app.post('/api/statements/:id/degrade', guard('ops'), (req, res) => {
+  const r = degradeStatement(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '危机声明不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 单份声明降级策略覆盖（发布终态前均可配置；body.reset=true 清空覆盖沿用全局默认）
+app.put('/api/statements/:id/degrade-policy', guard('ops'), (req, res) => {
+  const r = updateStatementPolicy(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '危机声明不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 全局默认降级策略（仅管理员；GET 随声明看板一并下发，此处提供独立读取）
+app.get('/api/statements-config/degrade-policy', (req, res) => {
+  res.json({ policy: getGlobalDegradePolicy(), modeText: DEGRADE_MODE_TEXT })
+})
+app.put('/api/statements-config/degrade-policy', guard('admin'), (req, res) => {
+  const b = req.body || {}
+  const policy = updateGlobalDegradePolicy({ mode: b.mode, maxFailRatio: b.maxFailRatio ?? b.max_fail_ratio, minSuccess: b.minSuccess ?? b.min_success }, req.actor)
+  res.json({ ok: true, policy })
 })
 function stmtChannelAction(handler) {
   return (req, res) => {

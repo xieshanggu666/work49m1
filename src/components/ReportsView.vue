@@ -161,7 +161,7 @@
 
             <!-- 危机声明 -->
             <section class="snap-sec">
-              <h5>📢 危机声明（{{ (snap.statements && snap.statements.total) || 0 }} 份 · 已发布 {{ (snap.statements && snap.statements.published) || 0 }}<template v-if="snap.statements && snap.statements.partial"> · 部分失败 {{ snap.statements.partial }}</template><template v-if="snap.statements && snap.statements.review"> · 待审 {{ snap.statements.review }}</template>）</h5>
+              <h5>📢 危机声明（{{ (snap.statements && snap.statements.total) || 0 }} 份 · 已发布 {{ (snap.statements && snap.statements.published) || 0 }}<template v-if="snap.statements && snap.statements.degraded"> · 降级发布 {{ snap.statements.degraded }}</template><template v-if="snap.statements && snap.statements.partial"> · 部分失败 {{ snap.statements.partial }}</template><template v-if="snap.statements && snap.statements.review"> · 待审 {{ snap.statements.review }}</template>）</h5>
               <div v-if="!snap.statements || !snap.statements.total" class="snap-empty">该事件暂无危机声明</div>
               <div v-for="st in (snap.statements && snap.statements.items) || []" :key="st.id" class="stmt-snap" :class="st.status">
                 <div class="stmt-snap-head">
@@ -175,6 +175,9 @@
                     {{ ch.channel_name }}<i>{{ stmtChText(ch.status) }}</i>
                   </span>
                 </div>
+                <span v-if="st.status==='degraded'" class="stmt-deg-note">
+                  ⬇ {{ st.degraded_mode==='auto' ? '自动' : '手动确认' }}降级发布（{{ st.degraded_by }} · {{ st.degraded_at }}）<template v-if="st.degrade_reason">：{{ st.degrade_reason }}</template>
+                </span>
                 <span v-if="st.review_note" class="stmt-note">⚖️ {{ st.review_note }}</span>
               </div>
             </section>
@@ -315,7 +318,7 @@ function logText(a) {
   return { create: '建档', edit: '编制', snapshot: '刷新快照', submit: '送审', approve: '审核通过', reject: '驳回', publish: '发布', rollback: '版本回滚' }[a] || a
 }
 function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动', notify: '通知回执', workorder: '工单联动' }[k] || k || '已解除' }
-function stmtStatusText(x) { return { draft: '起草中', review: '待法务审核', approved: '审核通过', publishing: '发布中', partial: '部分渠道失败', published: '已发布', cancelled: '已取消' }[x] || x }
+function stmtStatusText(x) { return { draft: '起草中', review: '待法务审核', approved: '审核通过', publishing: '发布中', partial: '部分渠道失败', degraded: '已降级发布', published: '已发布', cancelled: '已取消' }[x] || x }
 function stmtChText(x) { return { pending: '待执行', publishing: '执行中', success: '已发布', failed: '失败', cancelled: '已取消' }[x] || x }
 function extStatusText(x) { return { pending: '待审核', reviewing: '受理中', accepted: '已采纳', rejected: '已驳回', withdrawn: '已撤回' }[x] || x }
 function extKindText(x) { return { brand: '品牌方', regulator: '监管方', media: '媒体' }[x] || x }
@@ -539,8 +542,11 @@ input,select,textarea,button{font-family:inherit;}
 .tag.stmtst-draft{background:#263238;color:#b0bec5;}.tag.stmtst-review{background:#33270e;color:#ffe082;}
 .tag.stmtst-approved{background:#0d2137;color:#90caf9;}.tag.stmtst-publishing{background:#08303a;color:#80deea;}
 .tag.stmtst-partial{background:#4e2310;color:#ffab91;}
+.tag.stmtst-degraded{background:#251640;color:#b39ddb;}
+.stmt-deg-note{font-size:10px;color:#b39ddb;background:#221738;border:1px solid rgba(126,87,194,.4);border-radius:5px;padding:3px 8px;}
 .tag.stmtst-published{background:#1b5e20;color:#a5d6a7;}.tag.stmtst-cancelled{background:#21262c;color:#78909c;}
 .stmt-snap.partial{border-left:3px solid #ff7043;}
+.stmt-snap.degraded{border-left:3px solid #7e57c2;}
 .stmt-chs{display:flex;gap:6px;flex-wrap:wrap;}
 .stmt-ch{font-size:10px;padding:2px 9px;border-radius:5px;background:#0d2137;border:1px solid rgba(120,160,220,.2);color:#b0bec5;display:inline-flex;gap:5px;align-items:center;}
 .stmt-ch i{font-style:normal;}

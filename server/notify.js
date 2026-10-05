@@ -243,11 +243,14 @@ export function seedExtNotifyTasks() {
   return n
 }
 
-// ===== 危机声明渠道事件 → 通知任务（stmt_event：chfail 单渠道发布失败 / partial 全渠道登记完但存在失败） =====
+// ===== 危机声明渠道事件 → 通知任务（stmt_event：chfail 单渠道发布失败 / partial 全渠道登记完但存在失败 / degraded 按策略降级发布） =====
 // 复用通知渠道、失败退避重试、回执与升级调度；幂等键按 声明×事件（×渠道行）×订阅×渠道 去重。
 // chfail：每次渠道登记失败即时通知（同一渠道行重复登记失败按行幂等，重试后再失败可再次通知）；
-// partial：全部渠道到达终态但仍有失败渠道（声明进入「部分失败」、阻塞结案）时的督办通知，按声明幂等。
-export const STMT_EVENT_TEXT = { chfail: '渠道发布失败', partial: '部分渠道失败·发布未完成' }
+// partial：全部渠道到达终态但仍有失败渠道（声明进入「部分失败」、阻塞结案）时的督办通知，按声明×轮次幂等；
+// degraded：按可配置降级策略收口（失败渠道降级终止、保留失败记录，声明不再阻塞结案）时的知会，按声明×降级轮次幂等。
+export const STMT_EVENT_TEXT = {
+  chfail: '渠道发布失败', partial: '部分渠道失败·发布未完成', degraded: '声明降级发布·失败渠道降级终止'
+}
 export function generateForStatement(stmtId, stmtEvent, extra = {}) {
   const s = q1(`SELECT s.*, c.title crisis_title, c.topic crisis_topic
     FROM crisis_statements s LEFT JOIN crisis c ON c.id=s.crisis_id WHERE s.id=?`, stmtId)
@@ -258,7 +261,9 @@ export function generateForStatement(stmtId, stmtEvent, extra = {}) {
   const topic = s.crisis_topic || ''
   const title = stmtEvent === 'partial'
     ? `【声明发布未完成·部分渠道失败】${s.title}`
-    : `【声明渠道发布失败】${s.title}`
+    : stmtEvent === 'degraded'
+      ? `【声明降级发布·失败渠道降级终止】${s.title}`
+      : `【声明渠道发布失败】${s.title}`
   let idemTag
   if (stmtEvent === 'chfail') {
     const chRow = extra.channelRow ? q1('SELECT * FROM crisis_statement_channels WHERE id=?', extra.channelRow) : null
@@ -272,14 +277,31 @@ export function generateForStatement(stmtId, stmtEvent, extra = {}) {
     for (const sub of subs) {
       if (sub.topic && sub.topic !== topic) continue
       const content = `危机「${s.crisis_title || '#' + s.crisis_id}」声明「${s.title}」渠道【${chName || '未知渠道'}】发布失败` +
-        (failReason ? `：${failReason}` : '') + ` · 当前 ${ok}/${total} 个渠道已发布、${failed} 个失败，可重试或放弃该渠道`
+        (failReason ? `：${failReason}` : '') + ` · 当前 ${ok}/${total} 个渠道已发布、${failed} 个失败，可重试、放弃该渠道或按策略降级发布`
       all.push(...createTasks(sub, {
         kind: 'statement', statementId: s.id, crisisId: s.crisis_id,
         idemTag, corrId: `stmt${s.id}:channels`, title, content
       }))
     }
+  } else if (stmtEvent === 'degraded') {
+    // degraded：降级发布知会（手动/自动；按降级轮次幂等——补齐恢复后再次降级可再次知会）
+    const round = Math.max(1, +extra.degradeRound || 1)
+    idemTag = `degraded:${round}`
+    const auto = extra.mode === 'auto'
+    for (const sub of subs) {
+      if (sub.topic && sub.topic !== topic) continue
+      const content = `危机「${s.crisis_title || '#' + s.crisis_id}」声明「${s.title}」已按${auto ? '自动' : '手动确认'}降级策略收口：` +
+        `${extra.ok ?? 0}/${extra.total ?? 0} 个渠道已发布、${extra.failed ?? 0} 个失败渠道降级终止` +
+        (extra.cancelled ? `、${extra.cancelled} 个取消` : '') +
+        '；失败记录保留并可事后重试补齐，声明已不再阻塞危机结案' +
+        (typeof extra.failRatio === 'number' ? `（失败占比 ${Math.round(extra.failRatio * 100)}%）` : '')
+      all.push(...createTasks(sub, {
+        kind: 'statement', statementId: s.id, crisisId: s.crisis_id,
+        idemTag, corrId: `stmt${s.id}:degrade`, corrSeq: round, title, content
+      }))
+    }
   } else {
-    // partial：声明级督办（同一声明仅生成一次；重试恢复后再次失败以新事件轮次区分）
+    // partial：声明级督办（按进入部分失败的轮次幂等；重试恢复后再次失败以新事件轮次区分）
     const round = Math.max(1, +extra.partialRound || 1)
     idemTag = `partial:${round}`
     for (const sub of subs) {
@@ -287,7 +309,7 @@ export function generateForStatement(stmtId, stmtEvent, extra = {}) {
       const content = `危机「${s.crisis_title || '#' + s.crisis_id}」声明「${s.title}」分渠道登记全部结束但存在失败渠道：` +
         `${extra.ok ?? 0}/${extra.total ?? 0} 个渠道已发布、${extra.failed ?? 0} 个失败` +
         (extra.cancelled ? `、${extra.cancelled} 个取消` : '') +
-        '；发布未完成，危机暂不能结案，请重试失败渠道或放弃该渠道（取消）'
+        '；发布未完成，危机暂不能结案，请重试失败渠道、放弃该渠道（取消）或按降级策略确认降级发布'
       all.push(...createTasks(sub, {
         kind: 'statement', statementId: s.id, crisisId: s.crisis_id,
         idemTag, corrId: `stmt${s.id}:partial`, corrSeq: round, title, content
@@ -818,7 +840,7 @@ export function validateSub(b) {
   const ee = String(b.ext_event || '')
   if (ee && !['submitted', 'escalated'].includes(ee)) return '外部协作事件无效（submitted/escalated）'
   const se = String(b.stmt_event || '')
-  if (se && !['chfail', 'partial'].includes(se)) return '危机声明事件无效（chfail/partial）'
+  if (se && !['chfail', 'partial', 'degraded'].includes(se)) return '危机声明事件无效（chfail/partial/degraded）'
   if ([we, pe, ee, se, cs].filter(Boolean).length > 1) return '预警/危机/工单/传播/外部协作/声明事件订阅互斥，请只选一种匹配方式'
   const chs = Array.isArray(b.channel_ids) ? b.channel_ids.map(Number).filter(Number.isInteger) : []
   if (!chs.length) return '至少选择一个通知渠道'

@@ -132,14 +132,15 @@ export function buildSnapshot(crisisId) {
     guard_snapshot: safeParse(cl.guard_snapshot, null)
   }))
 
-  // ---- 危机声明：公关起草→法务审核→分渠道发布登记（含分渠道结果与回写口径） ----
+  // ---- 危机声明：公关起草→法务审核→分渠道发布登记（含分渠道结果、降级发布与回写口径） ----
   const stmtRows = q('SELECT * FROM crisis_statements WHERE crisis_id=? ORDER BY id ASC', crisisId)
   const statements = {
     total: stmtRows.length,
-    // 未完结口径与结案守卫同源：部分渠道失败（partial）仍属发布未完成，阻塞结案
+    // 未完结口径与结案守卫同源：部分渠道失败（partial）仍属发布未完成，阻塞结案；degraded（已降级发布）为发布终态
     open: stmtRows.filter((s) => ['draft', 'review', 'approved', 'publishing', 'partial'].includes(s.status)).length,
     published: stmtRows.filter((s) => s.status === 'published').length,
     partial: stmtRows.filter((s) => s.status === 'partial').length,
+    degraded: stmtRows.filter((s) => s.status === 'degraded').length,
     cancelled: stmtRows.filter((s) => s.status === 'cancelled').length,
     review: stmtRows.filter((s) => s.status === 'review').length,
     items: stmtRows.map((s) => {
@@ -148,6 +149,7 @@ export function buildSnapshot(crisisId) {
         id: s.id, title: s.title, status: s.status, priority: s.priority,
         drafted_by: s.drafted_by, reviewed_by: s.reviewed_by, review_note: s.review_note,
         publish_by: s.publish_by, published_at: s.published_at, work_order_id: s.work_order_id,
+        degraded_mode: s.degraded_mode, degraded_by: s.degraded_by, degraded_at: s.degraded_at, degrade_reason: s.degrade_reason,
         channels: chRows.map((ch) => ({
           channel: ch.channel, channel_name: ch.channel_name, status: ch.status,
           assignee: ch.assignee, result: ch.result, fail_reason: ch.fail_reason, published_at: ch.published_at
